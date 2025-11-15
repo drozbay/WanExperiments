@@ -1,2 +1,3 @@
-__pycache__/__init__.cpython-313.pyc
-__pycache__/nodes.cpython-313.pyc
+__pycache__/
+*.pyc
+
