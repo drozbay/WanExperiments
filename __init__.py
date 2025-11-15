@@ -1,7 +1,7 @@
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
-from .core import register_bindweave_model
+from .core import register_wan_experiments_models
 
-# Register BindWeave model at import time
-register_bindweave_model()
+# Register model enhancements at import time
+register_wan_experiments_models()
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

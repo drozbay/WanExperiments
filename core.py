@@ -151,15 +151,14 @@ class WAN21_BindweaveConfig(comfy.supported_models_base.BASE):
 
     @classmethod
     def matches(cls, unet_config, state_dict=None):
-        """
-        check for text_projection layer to identify BindWeave model
-        """
+        """Check if this is a BindWeave model"""
         if unet_config.get("image_model") != "wan2.1":
             return False
 
-        # if unet_config.get("model_type") != "bindweave":
-        #     return False
+        if unet_config.get("model_type") != "bindweave":
+            return False
 
+        # Optional: Verify text_projection exists in state_dict as confirmation
         if state_dict is not None:
             has_text_proj = any('text_projection' in k for k in state_dict.keys())
             if not has_text_proj:
@@ -188,13 +187,60 @@ class WAN21_BindweaveConfig(comfy.supported_models_base.BASE):
         )
 
 
-def register_bindweave_model():
+class WAN21_HuMo_I2V(comfy.model_base.WAN21_HuMo):
     """
-    Register WAN21_BindweaveConfig with ComfyUI's model loading system.
-    This must be called at import time (in __init__.py)
+    Add I2V support for HuMo
+    """
+
+    def extra_conds(self, **kwargs):
+        """Override to respect concat_latent_image instead of always creating zeros."""
+        out = super(comfy.model_base.WAN21_HuMo, self).extra_conds(**kwargs)
+        noise = kwargs.get("noise", None)
+        audio_embed = kwargs.get("audio_embed", None)
+
+        if audio_embed is not None:
+            out['audio_embed'] = comfy.conds.CONDRegular(audio_embed)
+
+        concat_latent_image = kwargs.get("concat_latent_image", None)
+
+        if "c_concat" not in out:  # 1.7B model
+            reference_latents = kwargs.get("reference_latents", None)
+            if reference_latents is not None:
+                out['reference_latent'] = comfy.conds.CONDRegular(self.process_latent_in(reference_latents[-1]))
+        else:
+            # THE FIX: Only create zeros if user didn't provide concat_latent_image
+            if concat_latent_image is None:
+                noise_shape = list(noise.shape)
+                noise_shape[1] += 4
+                concat_latent = torch.zeros(noise_shape, device=noise.device, dtype=noise.dtype)
+                zero_vae_values_first = torch.tensor([0.8660, -0.4326, -0.0017, -0.4884, -0.5283, 0.9207, -0.9896, 0.4433, -0.5543, -0.0113, 0.5753, -0.6000, -0.8346, -0.3497, -0.1926, -0.6938]).view(1, 16, 1, 1, 1)
+                zero_vae_values_second = torch.tensor([1.0869, -1.2370, 0.0206, -0.4357, -0.6411, 2.0307, -1.5972, 1.2659, -0.8595, -0.4654, 0.9638, -1.6330, -1.4310, -0.1098, -0.3856, -1.4583]).view(1, 16, 1, 1, 1)
+                zero_vae_values = torch.tensor([0.8642, -1.8583, 0.1577, 0.1350, -0.3641, 2.5863, -1.9670, 1.6065, -1.0475, -0.8678, 1.1734, -1.8138, -1.5933, -0.7721, -0.3289, -1.3745]).view(1, 16, 1, 1, 1)
+                concat_latent[:, 4:] = zero_vae_values
+                concat_latent[:, 4:, :1] = zero_vae_values_first
+                concat_latent[:, 4:, 1:2] = zero_vae_values_second
+                out['c_concat'] = comfy.conds.CONDNoiseShape(concat_latent)
+
+            reference_latents = kwargs.get("reference_latents", None)
+            if reference_latents is not None:
+                ref_latent = self.process_latent_in(reference_latents[-1])
+                ref_latent_shape = list(ref_latent.shape)
+                ref_latent_shape[1] += 4 + ref_latent_shape[1]
+                ref_latent_full = torch.zeros(ref_latent_shape, device=ref_latent.device, dtype=ref_latent.dtype)
+                ref_latent_full[:, 20:] = ref_latent
+                ref_latent_full[:, 16:20] = 1.0
+                out['reference_latent'] = comfy.conds.CONDRegular(ref_latent_full)
+
+        return out
+
+
+def register_wan_experiments_models():
+    """
+    This must be called at import time (in __init__.py).
     """
     import comfy.model_detection
 
+    # Add BindWeave detection
     original_detect = comfy.model_detection.detect_unet_config
 
     def detect_unet_config_with_bindweave(state_dict, key_prefix, metadata=None):
@@ -213,6 +259,20 @@ def register_bindweave_model():
         return dit_config
 
     comfy.model_detection.detect_unet_config = detect_unet_config_with_bindweave
+
+    # Register BindWeave config
     comfy.supported_models.models.insert(0, WAN21_BindweaveConfig)
 
-    log.info("[WanExperiments] Registered Bindweave model configuration")
+    # Patch HuMo to use I2V-enabled version
+    for i, model_config in enumerate(comfy.supported_models.models):
+        if model_config.__name__ == 'WAN21_HuMo':
+            original_get_model = model_config.get_model
+
+            def patched_get_model(self, state_dict, prefix="", device=None):
+                return WAN21_HuMo_I2V(self, device=device)
+
+            model_config.get_model = patched_get_model
+            log.info("[WanExperiments] Enabled I2V support for HuMo models")
+            break
+
+    log.info("[WanExperiments] Registered model enhancements: BindWeave, HuMo I2V")
