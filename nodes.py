@@ -282,13 +282,12 @@ class WanEx_BindweaveSubjectToVid:
                     "width": ("INT", {"default": 832, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 16}),
                     "height": ("INT", {"default": 480, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 16}),
                     "length": ("INT", {"default": 81, "min": 1, "max": nodes.MAX_RESOLUTION, "step": 4}),
-                    "clip_padding_strategy": (["no_padding", "zeros", "mean", "repeat_last"], {"default": "zeros"}),
                     "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
         },
         "optional": {
-                    "start_image": ("IMAGE",),
-                    "reference_images": ("IMAGE",),
-                    "mask": ("MASK",),
+                    "i2v_images": ("IMAGE",),
+                    "ref_images": ("IMAGE",),
+                    "i2v_masks": ("MASK",),
                     "ref_masks": ("MASK",),
                     "clip_vision_output": ("CLIP_VISION_OUTPUT",),
                     "qwen_conditioning_pos": ("CONDITIONING", {
@@ -304,8 +303,9 @@ class WanEx_BindweaveSubjectToVid:
     FUNCTION = "encode"
     CATEGORY = "WanExperiments"
 
-    def encode(self, positive, negative, vae, width, height, length, batch_size, clip_padding_strategy,
-            start_image=None, reference_images=None, mask=None, ref_masks=None, clip_vision_output=None,
+    def encode(self, positive, negative, vae, width, height, length, batch_size,
+            clip_padding_strategy="zeros", ref_mask_handling="mask_refs",
+            i2v_images=None, ref_images=None, i2v_masks=None, ref_masks=None, clip_vision_output=None,
             qwen_conditioning_pos=None, qwen_conditioning_neg=None,
             ):
 
@@ -320,8 +320,8 @@ class WanEx_BindweaveSubjectToVid:
 
         # Validate reference images
         num_references = 0
-        if reference_images is not None:
-            num_references = reference_images.shape[0]
+        if ref_images is not None:
+            num_references = ref_images.shape[0]
             if num_references > 4:
                 raise ValueError(f"BindWeave supports maximum 4 reference images, got {num_references}")
             debug_info.append(f"Reference images provided: {num_references}")
@@ -331,10 +331,10 @@ class WanEx_BindweaveSubjectToVid:
         # ========== STEP 2: ENCODE REFERENCE IMAGES INDIVIDUALLY ==========
         reference_latents = []
 
-        if reference_images is not None:
+        if ref_images is not None:
             debug_info.append("Encoding each reference image separately as 1-frame video:")
             for i in range(num_references):
-                ref_img = reference_images[i:i+1]
+                ref_img = ref_images[i:i+1]
                 ref_resized = comfy.utils.common_upscale(
                     ref_img.movedim(-1, 1), width, height, "bilinear", "center"
                 ).movedim(1, -1)
@@ -360,12 +360,12 @@ class WanEx_BindweaveSubjectToVid:
         start_latent = None
         frames_with_start_image = 0
 
-        if start_image is not None:
+        if i2v_images is not None:
             debug_info.append("Processing start_image:")
 
             # Resize and pad the image to match length
             start_image_resized = comfy.utils.common_upscale(
-                start_image[:length].movedim(-1, 1), width, height, "bilinear", "center"
+                i2v_images[:length].movedim(-1, 1), width, height, "bilinear", "center"
             ).movedim(1, -1)
 
             # Create full image tensor filled with 0.5 (neutral gray)
@@ -408,64 +408,64 @@ class WanEx_BindweaveSubjectToVid:
         # ========== STEP 6: MASK HANDLING ==========
         final_concat_mask = None
 
-        if mask is not None:
+        if i2v_masks is not None:
             debug_info.append("Processing provided mask:")
             debug_info.append("  Note: Mask is for start_image portion (reference masks added later)")
 
-            original_mask_shape = mask.shape
+            original_mask_shape = i2v_masks.shape
             debug_info.append(f"  Input mask shape: {original_mask_shape}")
 
-            if mask.ndim == 3:
+            if i2v_masks.ndim == 3:
                 # [temporal, h, w] -> [1, 1, temporal, h, w]
-                mask = mask.unsqueeze(0).unsqueeze(0)
-            elif mask.ndim == 4:
+                i2v_masks = i2v_masks.unsqueeze(0).unsqueeze(0)
+            elif i2v_masks.ndim == 4:
                 # Assume [temporal, channels, h, w] or [batch, temporal, h, w]
-                if mask.shape[1] <= 4:
+                if i2v_masks.shape[1] <= 4:
                     # [temporal, channels, h, w] -> [1, channels, temporal, h, w]
-                    mask = mask.unsqueeze(0).transpose(1, 2)
+                    i2v_masks = i2v_masks.unsqueeze(0).transpose(1, 2)
                 else:
                     # [batch, temporal, h, w] -> [batch, 1, temporal, h, w]
-                    mask = mask.unsqueeze(1)
+                    i2v_masks = i2v_masks.unsqueeze(1)
 
-            b_m, c_m, t_m, h_m, w_m = mask.shape
+            b_m, c_m, t_m, h_m, w_m = i2v_masks.shape
 
             # Resize mask to match start_image temporal dimension
             if t_m != temporal_latent:
                 if t_m == 1:
                     # Single mask - repeat for all frames
-                    mask = mask.repeat(1, 1, temporal_latent, 1, 1)
+                    i2v_masks = i2v_masks.repeat(1, 1, temporal_latent, 1, 1)
                 else:
-                    mask = torch.nn.functional.interpolate(
-                        mask, size=(temporal_latent, h_m, w_m), mode='nearest'
+                    i2v_masks = torch.nn.functional.interpolate(
+                        i2v_masks, size=(temporal_latent, h_m, w_m), mode='nearest'
                     )
                 debug_info.append(f"  Resized mask temporal: {t_m} -> {temporal_latent}")
                 t_m = temporal_latent
 
             # Handle channel dimension - convert to 4 channels if needed
             if c_m == 1:
-                mask = mask.repeat(1, 4, 1, 1, 1)
+                i2v_masks = i2v_masks.repeat(1, 4, 1, 1, 1)
                 c_m = 4
             elif c_m != 4:
-                mask = torch.mean(mask, dim=1, keepdim=True).repeat(1, 4, 1, 1, 1)
+                i2v_masks = torch.mean(i2v_masks, dim=1, keepdim=True).repeat(1, 4, 1, 1, 1)
                 c_m = 4
 
             # Resize spatial dimensions
             if h_m != latent_height or w_m != latent_width:
-                mask = comfy.utils.common_upscale(
-                    mask.view(-1, h_m, w_m).unsqueeze(1),
+                i2v_masks = comfy.utils.common_upscale(
+                    i2v_masks.view(-1, h_m, w_m).unsqueeze(1),
                     latent_width, latent_height, "bilinear", "center"
                 ).squeeze(1).view(b_m, c_m, t_m, latent_height, latent_width)
                 debug_info.append(f"  Resized mask spatial: {h_m}x{w_m} -> {latent_height}x{latent_width}")
 
-            final_concat_mask = mask
+            final_concat_mask = i2v_masks
             debug_info.append(f"  Final concat_mask shape: {final_concat_mask.shape}")
 
-        elif start_image is not None:
+        elif i2v_images is not None:
             # Auto-generate binary mask from start_image presence
             final_concat_mask = torch.ones(
                 (1, 4, temporal_latent, latent_height, latent_width),
-                device=start_image.device,
-                dtype=start_image.dtype
+                device=i2v_images.device,
+                dtype=i2v_images.dtype
             )
             latent_frames_with_image = ((frames_with_start_image - 1) // 4) + 1
             final_concat_mask[:, :, :latent_frames_with_image] = 0.0
@@ -481,9 +481,10 @@ class WanEx_BindweaveSubjectToVid:
         # ========== STEP 7: APPLY TO CONDITIONING ==========
 
         # BindWeave Architecture:
-        # - 4 reference frames PREPENDED to the I2V conditioning (channels 16-31)
-        # - concat_latent_image: [ref0, ref1, ref2, ref3, start_image frames] (25 frames)
-        # - concat_mask: matches concat_latent_image temporal dimension (25 frames)
+        # Channel layout: [noise (ch 0-15), mask (ch 16-19), concat_latent_image (ch 20-35)]
+        # - 4 reference frames PREPENDED to the I2V conditioning in concat_latent_image
+        # - concat_latent_image: [ref0, ref1, ref2, ref3, start_image frames] (25 frames, 16 channels)
+        # - concat_mask: matches concat_latent_image temporal dimension (25 frames, 4 channels)
         # - Noise padding is handled internally by WAN21_Bindweave._apply_model
 
         # Concatenate references + start_image for concat_latent_image (I2V conditioning)
@@ -491,12 +492,13 @@ class WanEx_BindweaveSubjectToVid:
         full_concat_latent = torch.cat([reference_concat, start_latent], dim=2)
         debug_info.append(f"concat_latent_image (refs + start): {full_concat_latent.shape}")
 
-        # Create mask to cover all frames (4 refs + 21 start = 25 total)
-        # Mask semantics (discovered through testing):
-        # - Reference frames WITH data → mask = 1.0 (use these frames)
-        # - Reference frames that are EMPTY (zero-padded) → mask = 0.0 (ignore)
-        # - Start image frames WITH data → mask = 0.0 (use these frames)
-        # - Frames to GENERATE → mask = 1.0 (generate these)
+        # Create mask to cover all frames (4 refs + start frames = total)
+        # Mask semantics:
+        # Default (mask_refs):
+        #   - Reference frames WITH data → mask = 0.0
+        #   - Reference frames EMPTY (zero-padded) → mask = 1.0
+        #   - Start image frames WITH data → mask = 0.0
+        #   - Frames to GENERATE → mask = 1.0
 
         if ref_masks is not None:
             # Use provided reference masks
@@ -548,26 +550,31 @@ class WanEx_BindweaveSubjectToVid:
 
         else:
             # Auto-generate reference mask based on num_references
-            reference_mask = torch.zeros(
+            reference_mask = torch.ones(
                 (1, 4, 4, latent_height, latent_width),
                 device=final_concat_mask.device,
                 dtype=final_concat_mask.dtype
             )
 
-            # Set mask to 1.0 for reference frames that have actual images
+            # Set mask to 0.0 for reference frames that have actual images
             if num_references > 0:
-                reference_mask[:, :, :num_references, :, :] = 1.0
-                debug_info.append(f"Reference mask: {num_references} frames set to 1.0 (use), {4-num_references} frames set to 0.0 (empty)")
+                reference_mask[:, :, :num_references, :, :] = 0.0
+                debug_info.append(f"Reference mask: {num_references} frames set to 0.0 (use), {4-num_references} frames set to 1.0 (empty)")
             else:
-                debug_info.append("Reference mask: all 4 frames set to 0.0 (no references)")
+                debug_info.append("Reference mask: all 4 frames set to 1.0 (no references)")
+
+        # Apply mask inversion if requested
+        if ref_mask_handling == "invert_mask_refs":
+            reference_mask = 1.0 - reference_mask
+            debug_info.append("Applied reference mask inversion (1.0 - mask)")
 
         # Concatenate reference mask with start_image mask
         full_mask = torch.cat([reference_mask, final_concat_mask], dim=2)
         debug_info.append(f"concat_mask (refs + start): {full_mask.shape}")
 
         conditioning_dict = {
-            "concat_latent_image": full_concat_latent,     # 4 refs + 21 start = 25 frames (ch 16-31)
-            "concat_mask": full_mask,                       # 25 frames (ch 32-35)
+            "concat_latent_image": full_concat_latent,     # 4 refs + 21 start = 25 frames (ch 20-35)
+            "concat_mask": full_mask,                       # 25 frames (ch 16-19)
             # Note: Noise padding handled internally by model
         }
 

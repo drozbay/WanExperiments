@@ -23,9 +23,9 @@ class WanBindweaveModel(comfy.ldm.wan.model.WanModel):
 
         # Create 3-layer MLP: 3584 -> 4096 -> 4096
         self.text_projection = nn.Sequential(
-            torch.nn.Linear(3584, text_dim, device=kwargs.get('device'), dtype=kwargs.get('dtype')),
+            torch.nn.Linear(3584, text_dim),
             nn.GELU(approximate='tanh'),
-            torch.nn.Linear(text_dim, text_dim, device=kwargs.get('device'), dtype=kwargs.get('dtype'))
+            torch.nn.Linear(text_dim, text_dim)
         )
 
         if BINDWEAVE_DEBUG:
@@ -40,7 +40,12 @@ class WanBindweaveModel(comfy.ldm.wan.model.WanModel):
                 log.info(f"  Input shape: {add_text_emb.shape}")
                 log.info(f"  Context shape before: {context.shape}")
 
-            projected = self.text_projection(add_text_emb)
+            text_proj_dtype = self.text_projection[0].weight.dtype
+            text_proj_device = self.text_projection[0].weight.device
+
+            add_text_emb_casted = comfy.model_management.cast_to_device(add_text_emb, text_proj_device, text_proj_dtype)
+            projected = self.text_projection(add_text_emb_casted)
+            projected = comfy.model_management.cast_to_device(projected, context.device, context.dtype)
 
             if BINDWEAVE_DEBUG:
                 log.info(f"  Projected shape: {projected.shape}")
@@ -64,6 +69,8 @@ class WAN21_Bindweave(comfy.model_base.WAN21):
             super().__init__(*args, **kwargs)
         finally:
             comfy.ldm.wan.model.WanModel = original_model_class
+
+        self.memory_usage_factor_conds = ("add_text_emb", "clip_fea")
 
         if BINDWEAVE_DEBUG:
             log.info("[WanExperiments] Created WAN21_Bindweave model wrapper")
@@ -119,6 +126,25 @@ class WAN21_Bindweave(comfy.model_base.WAN21):
             return super()._apply_model(x, t, c_concat=c_concat, c_crossattn=c_crossattn,
                                        control=control, transformer_options=transformer_options, **kwargs)
 
+    def extra_conds_shapes(self, **kwargs):
+        """Provide shapes for memory estimation."""
+        out = super().extra_conds_shapes(**kwargs)
+
+        # add_text_emb: (batch, seq_len, 3584) -> projected to (batch, seq_len, 4096)
+        add_text_emb = kwargs.get("add_text_emb", None)
+        if add_text_emb is not None:
+            # Shape for memory calculation: [batch, channels, seq_len]
+            out['add_text_emb'] = [add_text_emb.shape[0], 4096, add_text_emb.shape[1]]
+
+        # clip_fea: CLIP vision features (batch, 257, clip_dim) -> projected to (batch, 257, 4096)
+        clip_vision_output = kwargs.get("clip_vision_output", None)
+        if clip_vision_output is not None:
+            # CLIP vision typically has 257 tokens (1 cls + 256 patches)
+            hidden_states = clip_vision_output.penultimate_hidden_states
+            out['clip_fea'] = [hidden_states.shape[0], 4096, hidden_states.shape[1]]
+
+        return out
+
 
 class WAN21_BindweaveConfig(comfy.supported_models_base.BASE):
     """
@@ -138,7 +164,7 @@ class WAN21_BindweaveConfig(comfy.supported_models_base.BASE):
     unet_extra_config = {}
     latent_format = comfy.latent_formats.Wan21
 
-    memory_usage_factor = 0.9
+    memory_usage_factor = 1.0
 
     supported_inference_dtypes = [torch.float16, torch.bfloat16, torch.float32]
 
