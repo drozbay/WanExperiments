@@ -536,8 +536,8 @@ class WanEx_BindweaveSubjectToVid:
             elif ref_masks.shape[1] != 4:
                 ref_masks = torch.mean(ref_masks, dim=1, keepdim=True).repeat(1, 4, 1, 1, 1)
 
-            # Pad temporal dimension to 4 frames with zeros if needed
-            reference_mask = torch.zeros(
+            # Pad temporal dimension to 4 frames with ones (empty slots) if needed
+            reference_mask = torch.ones(
                 (1, 4, 4, latent_height, latent_width),
                 device=ref_masks.device,
                 dtype=ref_masks.dtype
@@ -546,7 +546,7 @@ class WanEx_BindweaveSubjectToVid:
             # Copy provided masks (up to 4 frames)
             frames_to_copy = min(num_ref_masks, 4)
             reference_mask[:, :, :frames_to_copy, :, :] = ref_masks[:, :, :frames_to_copy, :, :]
-            debug_info.append(f"Reference mask: Using {frames_to_copy} provided masks, {4-frames_to_copy} zero-padded")
+            debug_info.append(f"Reference mask: Using {frames_to_copy} provided masks, {4-frames_to_copy} ones-padded (empty)")
 
         else:
             # Auto-generate reference mask based on num_references

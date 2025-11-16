@@ -8,7 +8,7 @@ import comfy.model_base
 import comfy.supported_models
 import comfy.latent_formats
 
-BINDWEAVE_DEBUG = True
+BINDWEAVE_DEBUG = False
 
 log = logging.getLogger("WanExperiments")
 
