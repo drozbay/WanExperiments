@@ -46,8 +46,8 @@ class WanEx_I2VCustomEmbeds:
             }
         }
 
-    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT", "STRING")
-    RETURN_NAMES = ("positive", "negative", "latent", "debug_info")
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT", "STRING", "LATENT", "MASK")
+    RETURN_NAMES = ("positive", "negative", "latent", "debug_info", "concat_latent_preview", "concat_mask_preview")
     FUNCTION = "encode"
     CATEGORY = "WanExperiments"
 
@@ -136,95 +136,107 @@ class WanEx_I2VCustomEmbeds:
             debug_info.append(f"No input provided - created zero latent: {final_concat_latent.shape}")
 
         # Process concat_mask
+        # Output format: [1, 4, T_latent, H, W] where each of the 4 channels represents one pixel frame per latent frame
         final_concat_mask = None
 
         if concat_mask is not None:
             original_shape = concat_mask.shape
             debug_info.append(f"Input mask shape: {original_shape}")
 
+            # Normalize to [B, T, H, W] format
             if concat_mask.ndim == 3:
-                # ComfyUI pixel-space format: [temporal, height, width]
-                # First dimension is temporal (frames), not batch!
-                concat_mask = concat_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, temporal, height, width]
-                debug_info.append(f"Detected ComfyUI mask format [temporal, h, w] → [1, 1, {original_shape[0]}, {original_shape[1]}, {original_shape[2]}]")
-
+                concat_mask = concat_mask.unsqueeze(0)
+                debug_info.append(f"Detected ComfyUI mask format [temporal, h, w] → [1, {original_shape[0]}, {original_shape[1]}, {original_shape[2]}]")
             elif concat_mask.ndim == 4:
-                # Heuristic: if dim[1] is small (1-4), treat as channels
-                if concat_mask.shape[1] <= 4:
-                    # Assume [temporal, channels, height, width]
-                    concat_mask = concat_mask.unsqueeze(0)  # [1, temporal, channels, height, width]
-                    concat_mask = concat_mask.transpose(1, 2)  # [1, channels, temporal, height, width]
-                    debug_info.append(f"Assumed format [temporal, channels, h, w] → reshaped to [1, {concat_mask.shape[1]}, {concat_mask.shape[2]}, {concat_mask.shape[3]}, {concat_mask.shape[4]}]")
-                else:
-                    # Assume [batch, temporal, height, width]
-                    concat_mask = concat_mask.unsqueeze(1)  # [batch, 1, temporal, height, width]
-                    debug_info.append(f"Assumed format [batch, temporal, h, w] → added channel dim")
-
-            elif concat_mask.ndim != 5:
+                debug_info.append(f"Detected 4D mask format [batch, temporal, h, w]")
+            elif concat_mask.ndim == 5:
+                concat_mask = torch.mean(concat_mask, dim=1)
+                debug_info.append(f"Detected 5D mask format - averaged channels")
+            else:
                 raise ValueError(
                     f"concat_mask must be 3D, 4D, or 5D tensor, got {concat_mask.ndim}D with shape {concat_mask.shape}"
                 )
 
-            # Now should be 5D - validate shape
-            b_m, c_m, t_m, h_m, w_m = concat_mask.shape
-            debug_info.append(f"Mask as 5D: [batch={b_m}, channels={c_m}, temporal={t_m}, height={h_m}, width={w_m}]")
+            b_m, t_m, h_m, w_m = concat_mask.shape
 
-            if t_m != temporal_latent:
-                if t_m == 1:
-                    # Single frame mask - repeat to all temporal frames
-                    concat_mask = concat_mask.repeat(1, 1, temporal_latent, 1, 1)
-                    debug_info.append(f"Repeated single mask frame temporally: 1 -> {temporal_latent}")
-                else:
-                    concat_mask = torch.nn.functional.interpolate(
-                        concat_mask,
-                        size=(temporal_latent, h_m, w_m),
-                        mode='nearest'
-                    )
-                    debug_info.append(f"Resampled mask temporally (nearest-neighbor): {t_m} -> {temporal_latent} frames")
+            # Detect if mask is at pixel or latent temporal resolution
+            pixel_frames = (temporal_latent - 1) * 4 + 1
+            is_pixel_temporal = (t_m == pixel_frames or t_m == length)
 
-                t_m = temporal_latent
+            if is_pixel_temporal:
+                debug_info.append(f"Detected pixel-space temporal resolution: {t_m} frames → converting to latent-space")
 
-            # Handle channel dimension - convert to 4 channels if needed
-            if c_m == 1:
-                concat_mask = concat_mask.repeat(1, 4, 1, 1, 1)
-                c_m = 4
-                debug_info.append("Expanded mask from 1 to 4 channels")
-            elif c_m != 4:
-                # Average to single channel then repeat to 4
-                concat_mask = torch.mean(concat_mask, dim=1, keepdim=True).repeat(1, 4, 1, 1, 1)
-                c_m = 4
-                debug_info.append(f"Converted mask from {concat_mask.shape[1]} to 4 channels")
+                if h_m != latent_height or w_m != latent_width:
+                    concat_mask = comfy.utils.common_upscale(
+                        concat_mask.view(-1, h_m, w_m).unsqueeze(1),
+                        latent_width, latent_height, "bilinear", "center"
+                    ).squeeze(1).view(b_m, t_m, latent_height, latent_width)
+                    debug_info.append(f"Resized mask spatially: {h_m}x{w_m} → {latent_height}x{latent_width}")
 
-            # Resize spatial dimensions (bilinear for smooth interpolation)
-            if h_m != latent_height or w_m != latent_width:
-                concat_mask = comfy.utils.common_upscale(
-                    concat_mask.view(-1, h_m, w_m).unsqueeze(1),
-                    latent_width, latent_height, "bilinear", "center"
-                ).squeeze(1).view(b_m, c_m, t_m, latent_height, latent_width)
-                debug_info.append(f"Resized mask spatially (bilinear): {h_m}x{w_m} -> {latent_height}x{latent_width}")
+                # Convert pixel temporal to latent temporal with per-frame channel mapping
+                start_mask_repeated = concat_mask[:, 0:1].repeat(1, 4, 1, 1)
+                mask_middle = concat_mask[:, 1:]
+                concat_mask = torch.cat([start_mask_repeated, mask_middle], dim=1)
 
-            final_concat_mask = concat_mask
-            debug_info.append(f"Using direct mask input: final shape {final_concat_mask.shape}")
+                num_groups = concat_mask.shape[1] // 4
+                concat_mask = concat_mask[:, :num_groups * 4]
+                concat_mask = concat_mask.view(b_m, num_groups, 4, latent_height, latent_width)
+                concat_mask = concat_mask.transpose(1, 2)
+
+                final_concat_mask = concat_mask
+
+                debug_info.append(f"Converted pixel-space mask: {t_m} frames → {num_groups} latent frames with 4 channels")
+                debug_info.append(f"Each of 4 channels represents one pixel frame per latent frame")
+
+            else:
+                debug_info.append(f"Detected latent-space temporal resolution: {t_m} frames")
+
+                if h_m != latent_height or w_m != latent_width:
+                    concat_mask = comfy.utils.common_upscale(
+                        concat_mask.view(-1, h_m, w_m).unsqueeze(1),
+                        latent_width, latent_height, "bilinear", "center"
+                    ).squeeze(1).view(b_m, t_m, latent_height, latent_width)
+                    debug_info.append(f"Resized mask spatially: {h_m}x{w_m} → {latent_height}x{latent_width}")
+
+                concat_mask = concat_mask.unsqueeze(1).repeat(1, 4, 1, 1, 1)
+                final_concat_mask = concat_mask
+
+                debug_info.append(f"Expanded to 4 channels (all channels identical)")
+
+            debug_info.append(f"Final mask shape: {final_concat_mask.shape}")
 
         elif start_image is not None and processing_mode == "auto_from_image":
-            # Auto-generate binary mask from start_image presence
-            mask = torch.ones(
-                (1, 1, final_concat_latent.shape[2], latent_height, latent_width),
+            pixel_frames = (temporal_latent - 1) * 4 + 1
+            mask = torch.zeros(
+                (1, pixel_frames, latent_height, latent_width),
                 device=start_image.device,
                 dtype=start_image.dtype
             )
 
-            # Set mask to 0 for frames that have start_image data
-            frames_with_image = ((start_image.shape[0] - 1) // 4) + 1
-            mask[:, :, :frames_with_image] = 0.0
+            frames_with_image = min(start_image.shape[0], pixel_frames)
+            mask[:, :frames_with_image] = 1.0
+
+            debug_info.append(f"Auto-generated pixel-space mask: {frames_with_image}/{pixel_frames} frames from image")
+
+            # Convert to latent temporal format: [1, 4, T_latent, H, W]
+            start_mask_repeated = mask[:, 0:1].repeat(1, 4, 1, 1)
+            mask_middle = mask[:, 1:]
+            mask = torch.cat([start_mask_repeated, mask_middle], dim=1)
+
+            num_groups = mask.shape[1] // 4
+            mask = mask[:, :num_groups * 4]
+            mask = mask.view(1, num_groups, 4, latent_height, latent_width)
+            mask = mask.transpose(1, 2)
 
             final_concat_mask = mask
-            debug_info.append(f"Auto-generated binary mask: {frames_with_image} frames from image, rest generate")
+
+            debug_info.append(f"Converted to {num_groups} latent frames with 4 channels per frame")
 
         else:
-            # No mask provided and no start_image - create ones (all generate)
+            # No mask provided - create default mask (all generate)
+            # Format: [1, 4, T_latent, H, W]
             final_concat_mask = torch.ones(
-                (1, 1, temporal_latent, latent_height, latent_width),
+                (1, 4, temporal_latent, latent_height, latent_width),
                 device=comfy.model_management.intermediate_device()
             )
             debug_info.append(f"No mask provided - created ones mask (all generate): {final_concat_mask.shape}")
@@ -267,7 +279,10 @@ class WanEx_I2VCustomEmbeds:
 
         debug_text = "\n".join(debug_summary)
 
-        return (positive, negative, out_latent, debug_text)
+        concat_latent_preview = {"samples": final_concat_latent}
+        mask_preview = final_concat_mask.squeeze(0).permute(1, 0, 2, 3).reshape(-1, final_concat_mask.shape[3], final_concat_mask.shape[4])
+
+        return (positive, negative, out_latent, debug_text, concat_latent_preview, mask_preview)
     
 
 class WanEx_BindweaveSubjectToVid:
@@ -406,72 +421,87 @@ class WanEx_BindweaveSubjectToVid:
             debug_info.append(f"  Reference {i} (batched): {ref_lat.shape}")
 
         # ========== STEP 6: MASK HANDLING ==========
+        # Output format: [1, 4, T_latent, H, W] where each of the 4 channels represents one pixel frame per latent frame
         final_concat_mask = None
 
         if i2v_masks is not None:
             debug_info.append("Processing provided mask:")
-            debug_info.append("  Note: Mask is for start_image portion (reference masks added later)")
-
             original_mask_shape = i2v_masks.shape
             debug_info.append(f"  Input mask shape: {original_mask_shape}")
 
             if i2v_masks.ndim == 3:
-                # [temporal, h, w] -> [1, 1, temporal, h, w]
-                i2v_masks = i2v_masks.unsqueeze(0).unsqueeze(0)
+                i2v_masks = i2v_masks.unsqueeze(0)
             elif i2v_masks.ndim == 4:
-                # Assume [temporal, channels, h, w] or [batch, temporal, h, w]
-                if i2v_masks.shape[1] <= 4:
-                    # [temporal, channels, h, w] -> [1, channels, temporal, h, w]
-                    i2v_masks = i2v_masks.unsqueeze(0).transpose(1, 2)
-                else:
-                    # [batch, temporal, h, w] -> [batch, 1, temporal, h, w]
-                    i2v_masks = i2v_masks.unsqueeze(1)
+                debug_info.append(f"  Detected 4D mask")
+            elif i2v_masks.ndim == 5:
+                i2v_masks = torch.mean(i2v_masks, dim=1)
+                debug_info.append(f"  Averaged 5D mask channels")
+            else:
+                raise ValueError(f"i2v_masks must be 3D, 4D, or 5D, got {i2v_masks.ndim}D")
 
-            b_m, c_m, t_m, h_m, w_m = i2v_masks.shape
+            b_m, t_m, h_m, w_m = i2v_masks.shape
 
-            # Resize mask to match start_image temporal dimension
-            if t_m != temporal_latent:
-                if t_m == 1:
-                    # Single mask - repeat for all frames
-                    i2v_masks = i2v_masks.repeat(1, 1, temporal_latent, 1, 1)
-                else:
-                    i2v_masks = torch.nn.functional.interpolate(
-                        i2v_masks, size=(temporal_latent, h_m, w_m), mode='nearest'
-                    )
-                debug_info.append(f"  Resized mask temporal: {t_m} -> {temporal_latent}")
-                t_m = temporal_latent
+            pixel_frames = (temporal_latent - 1) * 4 + 1
+            is_pixel_temporal = (t_m == pixel_frames or t_m == length)
 
-            # Handle channel dimension - convert to 4 channels if needed
-            if c_m == 1:
-                i2v_masks = i2v_masks.repeat(1, 4, 1, 1, 1)
-                c_m = 4
-            elif c_m != 4:
-                i2v_masks = torch.mean(i2v_masks, dim=1, keepdim=True).repeat(1, 4, 1, 1, 1)
-                c_m = 4
+            if is_pixel_temporal:
+                debug_info.append(f"  Detected pixel-space temporal: {t_m} frames → converting to latent-space")
 
-            # Resize spatial dimensions
-            if h_m != latent_height or w_m != latent_width:
-                i2v_masks = comfy.utils.common_upscale(
-                    i2v_masks.view(-1, h_m, w_m).unsqueeze(1),
-                    latent_width, latent_height, "bilinear", "center"
-                ).squeeze(1).view(b_m, c_m, t_m, latent_height, latent_width)
-                debug_info.append(f"  Resized mask spatial: {h_m}x{w_m} -> {latent_height}x{latent_width}")
+                if h_m != latent_height or w_m != latent_width:
+                    i2v_masks = comfy.utils.common_upscale(
+                        i2v_masks.view(-1, h_m, w_m).unsqueeze(1),
+                        latent_width, latent_height, "bilinear", "center"
+                    ).squeeze(1).view(b_m, t_m, latent_height, latent_width)
 
-            final_concat_mask = i2v_masks
-            debug_info.append(f"  Final concat_mask shape: {final_concat_mask.shape}")
+                start_mask_repeated = i2v_masks[:, 0:1].repeat(1, 4, 1, 1)
+                mask_middle = i2v_masks[:, 1:]
+                i2v_masks = torch.cat([start_mask_repeated, mask_middle], dim=1)
+
+                num_groups = i2v_masks.shape[1] // 4
+                i2v_masks = i2v_masks[:, :num_groups * 4]
+                i2v_masks = i2v_masks.view(b_m, num_groups, 4, latent_height, latent_width)
+                i2v_masks = i2v_masks.transpose(1, 2)
+
+                final_concat_mask = i2v_masks
+                debug_info.append(f"  Converted: {t_m} frames → {num_groups} latent frames with 4 channels")
+
+            else:
+                debug_info.append(f"  Detected latent-space temporal: {t_m} frames")
+
+                if h_m != latent_height or w_m != latent_width:
+                    i2v_masks = comfy.utils.common_upscale(
+                        i2v_masks.view(-1, h_m, w_m).unsqueeze(1),
+                        latent_width, latent_height, "bilinear", "center"
+                    ).squeeze(1).view(b_m, t_m, latent_height, latent_width)
+
+                i2v_masks = i2v_masks.unsqueeze(1).repeat(1, 4, 1, 1, 1)
+                final_concat_mask = i2v_masks
+
+            debug_info.append(f"  Final mask shape: {final_concat_mask.shape}")
 
         elif i2v_images is not None:
-            # Auto-generate binary mask from start_image presence
-            final_concat_mask = torch.ones(
-                (1, 4, temporal_latent, latent_height, latent_width),
+            pixel_frames = (temporal_latent - 1) * 4 + 1
+            mask = torch.zeros(
+                (1, pixel_frames, latent_height, latent_width),
                 device=i2v_images.device,
                 dtype=i2v_images.dtype
             )
-            latent_frames_with_image = ((frames_with_start_image - 1) // 4) + 1
-            final_concat_mask[:, :, :latent_frames_with_image] = 0.0
-            debug_info.append(f"Auto-generated mask: {latent_frames_with_image} frames from start_image, rest generate")
+
+            mask[:, :frames_with_start_image] = 1.0
+
+            start_mask_repeated = mask[:, 0:1].repeat(1, 4, 1, 1)
+            mask_middle = mask[:, 1:]
+            mask = torch.cat([start_mask_repeated, mask_middle], dim=1)
+
+            num_groups = mask.shape[1] // 4
+            mask = mask[:, :num_groups * 4]
+            mask = mask.view(1, num_groups, 4, latent_height, latent_width)
+            mask = mask.transpose(1, 2)
+
+            final_concat_mask = mask
+            debug_info.append(f"Auto-generated mask: {frames_with_start_image} pixel frames → {num_groups} latent frames")
+
         else:
-            # No start_image - all generate
             final_concat_mask = torch.ones(
                 (1, 4, temporal_latent, latent_height, latent_width),
                 device=comfy.model_management.intermediate_device()
