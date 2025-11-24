@@ -46,8 +46,8 @@ class WanEx_I2VCustomEmbeds:
             }
         }
 
-    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT", "STRING", "LATENT", "MASK")
-    RETURN_NAMES = ("positive", "negative", "latent", "debug_info", "concat_latent_preview", "concat_mask_preview")
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT", "STRING", "LATENT", "MASK", "MASK")
+    RETURN_NAMES = ("positive", "negative", "latent", "debug_info", "concat_latent_preview", "concat_mask_preview", "mask_channels_preview")
     FUNCTION = "encode"
     CATEGORY = "WanExperiments"
 
@@ -207,14 +207,14 @@ class WanEx_I2VCustomEmbeds:
 
         elif start_image is not None and processing_mode == "auto_from_image":
             pixel_frames = (temporal_latent - 1) * 4 + 1
-            mask = torch.zeros(
+            mask = torch.ones(
                 (1, pixel_frames, latent_height, latent_width),
                 device=start_image.device,
                 dtype=start_image.dtype
             )
 
             frames_with_image = min(start_image.shape[0], pixel_frames)
-            mask[:, :frames_with_image] = 1.0
+            mask[:, :frames_with_image] = 0.0
 
             debug_info.append(f"Auto-generated pixel-space mask: {frames_with_image}/{pixel_frames} frames from image")
 
@@ -280,9 +280,10 @@ class WanEx_I2VCustomEmbeds:
         debug_text = "\n".join(debug_summary)
 
         concat_latent_preview = {"samples": final_concat_latent}
-        mask_preview = final_concat_mask.squeeze(0).permute(1, 0, 2, 3).reshape(-1, final_concat_mask.shape[3], final_concat_mask.shape[4])
+        mask_preview = final_concat_mask[0, 0].float()
+        mask_channels_preview = final_concat_mask[0].permute(1, 0, 2, 3).reshape(-1, final_concat_mask.shape[3], final_concat_mask.shape[4])
 
-        return (positive, negative, out_latent, debug_text, concat_latent_preview, mask_preview)
+        return (positive, negative, out_latent, debug_text, concat_latent_preview, mask_preview, mask_channels_preview)
     
 
 class WanEx_BindweaveSubjectToVid:
@@ -313,8 +314,8 @@ class WanEx_BindweaveSubjectToVid:
                     }),
         }}
 
-    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT", "STRING", "LATENT", "MASK")
-    RETURN_NAMES = ("positive", "negative", "latent", "debug_info", "concat_latent_preview", "concat_mask_preview")
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT", "STRING", "LATENT", "MASK", "MASK")
+    RETURN_NAMES = ("positive", "negative", "latent", "debug_info", "concat_latent_preview", "concat_mask_preview", "mask_channels_preview")
     FUNCTION = "encode"
     CATEGORY = "WanExperiments"
 
@@ -429,6 +430,7 @@ class WanEx_BindweaveSubjectToVid:
             original_mask_shape = i2v_masks.shape
             debug_info.append(f"  Input mask shape: {original_mask_shape}")
 
+            # Normalize to [B, T, H, W] format
             if i2v_masks.ndim == 3:
                 i2v_masks = i2v_masks.unsqueeze(0)
             elif i2v_masks.ndim == 4:
@@ -441,6 +443,7 @@ class WanEx_BindweaveSubjectToVid:
 
             b_m, t_m, h_m, w_m = i2v_masks.shape
 
+            # Detect if mask is at pixel or latent temporal resolution
             pixel_frames = (temporal_latent - 1) * 4 + 1
             is_pixel_temporal = (t_m == pixel_frames or t_m == length)
 
@@ -453,6 +456,7 @@ class WanEx_BindweaveSubjectToVid:
                         latent_width, latent_height, "bilinear", "center"
                     ).squeeze(1).view(b_m, t_m, latent_height, latent_width)
 
+                # Convert pixel temporal to latent temporal with per-frame channel mapping
                 start_mask_repeated = i2v_masks[:, 0:1].repeat(1, 4, 1, 1)
                 mask_middle = i2v_masks[:, 1:]
                 i2v_masks = torch.cat([start_mask_repeated, mask_middle], dim=1)
@@ -480,15 +484,17 @@ class WanEx_BindweaveSubjectToVid:
             debug_info.append(f"  Final mask shape: {final_concat_mask.shape}")
 
         elif i2v_images is not None:
+            # Auto-generate mask at pixel temporal resolution
             pixel_frames = (temporal_latent - 1) * 4 + 1
-            mask = torch.zeros(
+            mask = torch.ones(
                 (1, pixel_frames, latent_height, latent_width),
                 device=i2v_images.device,
                 dtype=i2v_images.dtype
             )
 
-            mask[:, :frames_with_start_image] = 1.0
+            mask[:, :frames_with_start_image] = 0.0
 
+            # Convert to latent temporal format: [1, 4, T_latent, H, W]
             start_mask_repeated = mask[:, 0:1].repeat(1, 4, 1, 1)
             mask_middle = mask[:, 1:]
             mask = torch.cat([start_mask_repeated, mask_middle], dim=1)
@@ -748,10 +754,10 @@ class WanEx_BindweaveSubjectToVid:
 
         # Create preview outputs (like WanVideoWrapper's WanVideoAddBindweaveEmbeds)
         concat_latent_preview = {"samples": full_concat_latent}
-        # full_mask shape: [1, 4, T, H, W] - take first batch, first channel for preview
-        concat_mask_preview = full_mask[0, 0].float()  # [T, H, W]
+        concat_mask_preview = full_mask[0, 0].float()
+        mask_channels_preview = full_mask[0].permute(1, 0, 2, 3).reshape(-1, full_mask.shape[3], full_mask.shape[4])
 
-        return (positive, negative, out_latent, debug_text, concat_latent_preview, concat_mask_preview)
+        return (positive, negative, out_latent, debug_text, concat_latent_preview, concat_mask_preview, mask_channels_preview)
 
 class WanEx_QwenVLTextConditioning:
     """Encode QwenVL text without template wrapping. Returns CONDITIONING type."""
@@ -774,14 +780,50 @@ class WanEx_QwenVLTextConditioning:
         return (conditioning,)
 
 
+class WanEx_ImageEmbedsPreview:
+    """Preview image_embeds from WanVideoWrapper nodes without modification. Outputs latent and mask for inspection."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image_embeds": ("WANVIDIMAGE_EMBEDS",),
+            }
+        }
+
+    RETURN_TYPES = ("WANVIDIMAGE_EMBEDS", "LATENT", "MASK", "MASK")
+    RETURN_NAMES = ("image_embeds", "latent_preview", "mask_preview", "mask_channels_preview")
+    FUNCTION = "preview"
+    CATEGORY = "WanExperiments"
+
+    def preview(self, image_embeds):
+        latent = image_embeds.get("image_embeds", None)
+        mask = image_embeds.get("mask", None)
+
+        latent_preview = None
+        mask_preview = None
+        mask_channels_preview = None
+
+        if latent is not None:
+            latent_preview = {"samples": latent.unsqueeze(0) if latent.ndim == 4 else latent}
+
+        if mask is not None:
+            mask_preview = mask[0].float()
+            mask_channels_preview = mask.permute(1, 0, 2, 3).reshape(-1, mask.shape[2], mask.shape[3]).float()
+
+        return (image_embeds, latent_preview, mask_preview, mask_channels_preview)
+
+
 NODE_CLASS_MAPPINGS = {
     "WanEx_I2VCustomEmbeds": WanEx_I2VCustomEmbeds,
     "WanEx_BindweaveSubjectToVid": WanEx_BindweaveSubjectToVid,
     "WanEx_QwenVLTextConditioning": WanEx_QwenVLTextConditioning,
+    "WanEx_ImageEmbedsPreview": WanEx_ImageEmbedsPreview,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanEx_I2VCustomEmbeds": "WanEx I2VCustomEmbeds",
     "WanEx_BindweaveSubjectToVid": "WanEx BindweaveSubjectToVid",
     "WanEx_QwenVLTextConditioning": "WanEx QwenVLTextConditioning",
+    "WanEx_ImageEmbedsPreview": "WanEx ImageEmbedsPreview",
 }
