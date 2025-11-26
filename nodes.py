@@ -814,11 +814,220 @@ class WanEx_ImageEmbedsPreview:
         return (image_embeds, latent_preview, mask_preview, mask_channels_preview)
 
 
+class WanEx_ConditioningEmbedsPreview:
+    """Extract and preview concat_latent_image and concat_mask from CONDITIONING. Useful for debugging conditioning data."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "conditioning": ("CONDITIONING",),
+            }
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "LATENT", "MASK", "MASK")
+    RETURN_NAMES = ("conditioning", "concat_latent_preview", "concat_mask_preview", "mask_channels_preview")
+    FUNCTION = "preview"
+    CATEGORY = "WanExperiments"
+
+    def preview(self, conditioning):
+        concat_latent = None
+        mask_preview = None
+        mask_channels_preview = None
+
+        if conditioning and len(conditioning) > 0:
+            cond_dict = conditioning[0][1]
+
+            concat_latent_image = cond_dict.get("concat_latent_image", None)
+            concat_mask = cond_dict.get("concat_mask", None)
+
+            if concat_latent_image is not None:
+                concat_latent = {"samples": concat_latent_image}
+
+            if concat_mask is not None:
+                if concat_mask.ndim == 5:
+                    mask_preview = concat_mask[0, 0].float()
+                    mask_channels_preview = concat_mask[0].permute(1, 0, 2, 3).reshape(-1, concat_mask.shape[3], concat_mask.shape[4]).float()
+                elif concat_mask.ndim == 4:
+                    mask_preview = concat_mask[0].float()
+                    mask_channels_preview = concat_mask.permute(1, 0, 2, 3).reshape(-1, concat_mask.shape[2], concat_mask.shape[3]).float()
+
+        return (conditioning, concat_latent, mask_preview, mask_channels_preview)
+
+# Derived from ComfyUI-PainterI2V motion amplitude scaling math - https://github.com/princepainter/ComfyUI-PainterI2V
+class WanEx_PainterMotionAmplitude:
+    """
+    Applies PainterI2V motion amplitude scaling to existing conditioning.
+    Works with conditioning that has concat_latent_image already set (e.g., from WanImageToVideo or WanEx I2VCustomEmbeds).
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "motion_amplitude": ("FLOAT", {"default": 1.15, "min": 1.0, "max": 2.0, "step": 0.05}),
+                "base_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "mean_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "base_frame": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 1}),
+            },
+            "optional": {
+                "motion_mask": ("MASK",),
+            }
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING")
+    RETURN_NAMES = ("positive", "negative")
+    FUNCTION = "execute"
+    CATEGORY = "conditioning/video_models"
+    DISPLAY_NAME = "WanEx PainterMotionAmplitude"
+
+    def execute(
+        self,
+        positive,
+        negative,
+        motion_amplitude=1.15,
+        base_strength=1.0,
+        mean_strength=1.0,
+        base_frame=0,
+        motion_mask=None,
+    ):
+        # Extract concat_latent_image from positive conditioning
+        if len(positive) == 0 or "concat_latent_image" not in positive[0][1]:
+            raise RuntimeError("WanEx PainterMotionAmplitude: conditioning must have 'concat_latent_image' set (e.g., from WanImageToVideo node)")
+
+        concat_latent_image = positive[0][1]["concat_latent_image"].clone()
+        num_frames = concat_latent_image.shape[2]
+
+        # Validate base_frame
+        if base_frame < 0 or base_frame >= num_frames:
+            raise RuntimeError(f"WanEx PainterMotionAmplitude: base_frame {base_frame} is out of range (0 to {num_frames - 1})")
+
+        # Determine mask for scaling
+        # We support two modes:
+        # 1. Full-frame masks: average spatially, threshold, apply scaling to entire frame
+        # 2. Partial masks: apply scaling only to masked regions (spatial blending)
+
+        spatial_mask = None  # Will be set if we need per-pixel blending
+
+        if motion_mask is not None:
+            # Use provided motion_mask
+            # Threshold to binary
+            motion_mask = (motion_mask > 0.5).float()
+
+            # Reshape to match latent dimensions [1, 1, T, H, W]
+            if motion_mask.dim() == 3:
+                # [T, H, W] -> [1, 1, T, H, W]
+                spatial_mask = motion_mask.unsqueeze(0).unsqueeze(0)
+            elif motion_mask.dim() == 4:
+                # [B, T, H, W] or [1, T, H, W] -> [1, 1, T, H, W]
+                if motion_mask.shape[0] == 1:
+                    spatial_mask = motion_mask.unsqueeze(1)
+                else:
+                    spatial_mask = motion_mask.unsqueeze(0)
+            else:
+                spatial_mask = motion_mask.view(1, 1, -1, 1, 1)
+
+            # Resize spatial dims to match latent if needed
+            latent_h, latent_w = concat_latent_image.shape[3], concat_latent_image.shape[4]
+            if spatial_mask.shape[3] != latent_h or spatial_mask.shape[4] != latent_w:
+                spatial_mask = torch.nn.functional.interpolate(
+                    spatial_mask.view(-1, 1, spatial_mask.shape[3], spatial_mask.shape[4]),
+                    size=(latent_h, latent_w),
+                    mode='nearest'
+                ).view(1, 1, -1, latent_h, latent_w)
+
+            # Adjust temporal dimension
+            if spatial_mask.shape[2] < num_frames:
+                # Pad with ones (scale remaining frames)
+                pad_frames = num_frames - spatial_mask.shape[2]
+                padding = torch.ones(1, 1, pad_frames, latent_h, latent_w, device=spatial_mask.device, dtype=spatial_mask.dtype)
+                spatial_mask = torch.cat([spatial_mask, padding], dim=2)
+            elif spatial_mask.shape[2] > num_frames:
+                spatial_mask = spatial_mask[:, :, :num_frames]
+
+            # Check if mask is full-frame or partial per frame
+            frame_mask = spatial_mask.mean(dim=(0, 1, 3, 4))  # [T]
+
+        elif "concat_mask" in positive[0][1]:
+            # Use concat_mask from conditioning
+            concat_mask = positive[0][1]["concat_mask"]
+            # Threshold to binary
+            concat_mask = (concat_mask > 0.5).float()
+            # concat_mask shape: [1, C, T, H, W] - average across channels for spatial mask
+            spatial_mask = concat_mask.mean(dim=1, keepdim=True)  # [1, 1, T, H, W]
+            frame_mask = spatial_mask.mean(dim=(0, 1, 3, 4))  # [T]
+        else:
+            # No mask available - assume all frames except base_frame are noise
+            frame_mask = torch.ones(num_frames, device=concat_latent_image.device, dtype=concat_latent_image.dtype)
+            frame_mask[base_frame] = 0.0
+            spatial_mask = None
+
+        # Identify frames that have any masked pixels (need scaling)
+        # A frame needs processing if its average mask > 0 (has some pixels to scale)
+        frames_to_process = (frame_mask > 0.01).nonzero(as_tuple=True)[0]
+
+        if len(frames_to_process) == 0:
+            # No frames to scale, return unchanged
+            return (positive, negative)
+
+        # Skip if no scaling needed
+        if motion_amplitude == 1.0 and base_strength == 1.0 and mean_strength == 1.0:
+            return (positive, negative)
+
+        # Get base frame latent
+        base_latent = concat_latent_image[:, :, base_frame:base_frame+1]
+
+        # Apply motion amplitude scaling to each frame that needs it
+        for idx in frames_to_process:
+            idx = idx.item()
+            if idx == base_frame:
+                continue  # Don't modify the base frame
+
+            noise_latent = concat_latent_image[:, :, idx:idx+1]
+
+            # Compute residual and its mean
+            diff = noise_latent - base_latent
+            diff_mean = diff.mean(dim=(1, 3, 4), keepdim=True)
+            diff_centered = diff - diff_mean
+
+            # Scale: modulated base + scaled centered residual + scaled mean
+            scaled = (base_latent * base_strength) + (diff_centered * motion_amplitude) + (diff_mean * mean_strength)
+            scaled = torch.clamp(scaled, -6, 6)
+
+            # Apply spatially if we have a partial mask
+            if spatial_mask is not None:
+                frame_spatial_mask = spatial_mask[:, :, idx:idx+1]
+                # Check if this frame has a partial mask (not all 0 or all 1)
+                mask_mean = frame_spatial_mask.mean()
+                if mask_mean > 0.01 and mask_mean < 0.99:
+                    # Partial mask - blend between original and scaled
+                    scaled = noise_latent * (1 - frame_spatial_mask) + scaled * frame_spatial_mask
+
+            concat_latent_image[:, :, idx:idx+1] = scaled
+
+        # Update conditioning
+        def update_conditioning(cond, new_latent):
+            new_cond = []
+            for c_tensor, c_dict in cond:
+                new_dict = c_dict.copy()
+                new_dict["concat_latent_image"] = new_latent
+                new_cond.append([c_tensor, new_dict])
+            return new_cond
+
+        pos_out = update_conditioning(positive, concat_latent_image)
+        neg_out = update_conditioning(negative, concat_latent_image)
+
+        return (pos_out, neg_out)
+
 NODE_CLASS_MAPPINGS = {
     "WanEx_I2VCustomEmbeds": WanEx_I2VCustomEmbeds,
     "WanEx_BindweaveSubjectToVid": WanEx_BindweaveSubjectToVid,
     "WanEx_QwenVLTextConditioning": WanEx_QwenVLTextConditioning,
     "WanEx_ImageEmbedsPreview": WanEx_ImageEmbedsPreview,
+    "WanEx_ConditioningEmbedsPreview": WanEx_ConditioningEmbedsPreview,
+    "WanEx_PainterMotionAmplitude": WanEx_PainterMotionAmplitude,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -826,4 +1035,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanEx_BindweaveSubjectToVid": "WanEx BindweaveSubjectToVid",
     "WanEx_QwenVLTextConditioning": "WanEx QwenVLTextConditioning",
     "WanEx_ImageEmbedsPreview": "WanEx ImageEmbedsPreview",
+    "WanEx_ConditioningEmbedsPreview": "WanEx ConditioningEmbedsPreview",
+    "WanEx_PainterMotionAmplitude": "WanEx PainterMotionAmplitude",
 }
