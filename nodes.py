@@ -1039,6 +1039,7 @@ class WanEx_HuMoImageToVideo(io.ComfyNode):
                 io.AudioEncoderOutput.Input("audio_encoder_output", optional=True),
                 io.Image.Input("ref_images", optional=True),
                 io.Image.Input("start_images", optional=True),
+                io.Image.Input("end_images", optional=True),
             ],
             outputs=[
                 io.Conditioning.Output(display_name="positive"),
@@ -1049,7 +1050,7 @@ class WanEx_HuMoImageToVideo(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, positive, negative, vae, width, height, length, batch_size, ref_images=None, audio_encoder_output=None, start_images=None) -> io.NodeOutput:
+    def execute(cls, positive, negative, vae, width, height, length, batch_size, ref_images=None, audio_encoder_output=None, start_images=None, end_images=None) -> io.NodeOutput:
         latent_t = ((length - 1) // 4) + 1
         latent_height = height // 8
         latent_width = width // 8
@@ -1092,27 +1093,43 @@ class WanEx_HuMoImageToVideo(io.ComfyNode):
             # If no audio embedding, leave as none, model code handles it
             pass
 
-        if start_images is not None:
-            start_image_resized = comfy.utils.common_upscale(
-                start_images[:length].movedim(-1, 1), width, height, "bilinear", "center"
-            ).movedim(1, -1)
+        pixel_frames = (latent_t - 1) * 4 + 1
+        have_start = start_images is not None
+        have_end = end_images is not None
 
+        if have_start or have_end:
+            # Prefill neutral gray frames once, then overlay start/end data
             image = torch.ones(
-                (length, height, width, start_image_resized.shape[-1]),
-                device=start_image_resized.device,
-                dtype=start_image_resized.dtype,
+                (length, height, width, 3),
+                device=comfy.model_management.intermediate_device(),
+                dtype=torch.float32,
             ) * 0.5
-            image[:start_image_resized.shape[0]] = start_image_resized
-            concat_latent_image = vae.encode(image[:, :, :, :3])
 
-            pixel_frames = (latent_t - 1) * 4 + 1
             mask = torch.ones(
                 (1, pixel_frames, latent_height, latent_width),
-                device=start_images.device,
-                dtype=start_images.dtype,
+                device=image.device,
+                dtype=image.dtype,
             )
-            frames_with_image = min(start_images.shape[0], pixel_frames)
-            mask[:, :frames_with_image] = 0.0
+
+            if have_start:
+                start_resized = comfy.utils.common_upscale(
+                    start_images[:length].movedim(-1, 1), width, height, "bilinear", "center"
+                ).movedim(1, -1)
+                image[:start_resized.shape[0]] = start_resized[:, :, :, :3]
+                start_frames = min(start_images.shape[0], pixel_frames)
+                mask[:, :start_frames] = 0.0
+
+            if have_end:
+                end_resized = comfy.utils.common_upscale(
+                    end_images[:length].movedim(-1, 1), width, height, "bilinear", "center"
+                ).movedim(1, -1)
+                tail = end_resized.shape[0]
+                if tail > 0:
+                    image[-tail:] = end_resized[:, :, :, :3]
+                    end_frames = min(end_images.shape[0], pixel_frames)
+                    mask[:, -end_frames:] = 0.0
+
+            concat_latent_image = vae.encode(image)
 
             start_mask_repeated = mask[:, 0:1].repeat(1, 4, 1, 1)
             mask_middle = mask[:, 1:]
