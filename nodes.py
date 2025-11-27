@@ -2,6 +2,7 @@ import nodes
 import comfy.utils
 import comfy.model_management
 import comfy.clip_vision
+from comfy_api.latest import io
 import node_helpers
 import torch
 
@@ -880,7 +881,7 @@ class WanEx_PainterMotionAmplitude:
     RETURN_TYPES = ("CONDITIONING", "CONDITIONING")
     RETURN_NAMES = ("positive", "negative")
     FUNCTION = "execute"
-    CATEGORY = "conditioning/video_models"
+    CATEGORY = "WanExperiments"
     DISPLAY_NAME = "WanEx PainterMotionAmplitude"
 
     def execute(
@@ -1020,6 +1021,118 @@ class WanEx_PainterMotionAmplitude:
         neg_out = update_conditioning(negative, concat_latent_image)
 
         return (pos_out, neg_out)
+    
+class WanEx_HuMoImageToVideo(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="WanEx_HuMoImageToVideo",
+            category="WanExperiments",
+            inputs=[
+                io.Conditioning.Input("positive"),
+                io.Conditioning.Input("negative"),
+                io.Vae.Input("vae"),
+                io.Int.Input("width", default=832, min=16, max=nodes.MAX_RESOLUTION, step=16),
+                io.Int.Input("height", default=480, min=16, max=nodes.MAX_RESOLUTION, step=16),
+                io.Int.Input("length", default=97, min=1, max=nodes.MAX_RESOLUTION, step=4),
+                io.Int.Input("batch_size", default=1, min=1, max=4096),
+                io.AudioEncoderOutput.Input("audio_encoder_output", optional=True),
+                io.Image.Input("ref_images", optional=True),
+                io.Image.Input("start_images", optional=True),
+            ],
+            outputs=[
+                io.Conditioning.Output(display_name="positive"),
+                io.Conditioning.Output(display_name="negative"),
+                io.Latent.Output(display_name="latent"),
+            ],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, positive, negative, vae, width, height, length, batch_size, ref_images=None, audio_encoder_output=None, start_images=None) -> io.NodeOutput:
+        latent_t = ((length - 1) // 4) + 1
+        latent_height = height // 8
+        latent_width = width // 8
+        latent = torch.zeros([batch_size, 16, latent_t, latent_height, latent_width], device=comfy.model_management.intermediate_device())
+
+        if ref_images is not None:
+            ref_images = comfy.utils.common_upscale(ref_images[:].movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
+            num_refs = ref_images.shape[0]
+            ref_latent = vae.encode(ref_images[:1, :, :, :3])
+            # Append the other reference latents
+            for i in range(num_refs - 1):
+                ref_latent = torch.cat((ref_latent, vae.encode(ref_images[i + 1:i + 2, :, :, :3])), dim=2)
+            positive = node_helpers.conditioning_set_values(positive, {"reference_latents": [ref_latent]}, append=True)
+            negative = node_helpers.conditioning_set_values(negative, {"reference_latents": [torch.zeros_like(ref_latent)]}, append=True)
+        else:
+            zero_latent = torch.zeros([batch_size, 16, 1, height // 8, width // 8], device=comfy.model_management.intermediate_device())
+            positive = node_helpers.conditioning_set_values(positive, {"reference_latents": [zero_latent]}, append=True)
+            negative = node_helpers.conditioning_set_values(negative, {"reference_latents": [zero_latent]}, append=True)
+
+        if audio_encoder_output is not None:
+            audio_emb = torch.stack(audio_encoder_output["encoded_audio_all_layers"], dim=2)
+            audio_len = audio_encoder_output["audio_samples"] // 640
+            audio_emb = audio_emb[:, :audio_len * 2]
+
+            from comfy_extras.nodes_wan import linear_interpolation, get_audio_emb_window
+
+            feat0 = linear_interpolation(audio_emb[:, :, 0: 8].mean(dim=2), 50, 25)
+            feat1 = linear_interpolation(audio_emb[:, :, 8: 16].mean(dim=2), 50, 25)
+            feat2 = linear_interpolation(audio_emb[:, :, 16: 24].mean(dim=2), 50, 25)
+            feat3 = linear_interpolation(audio_emb[:, :, 24: 32].mean(dim=2), 50, 25)
+            feat4 = linear_interpolation(audio_emb[:, :, 32], 50, 25)
+            audio_emb = torch.stack([feat0, feat1, feat2, feat3, feat4], dim=2)[0]  # [T, 5, 1280]
+            audio_emb, _ = get_audio_emb_window(audio_emb, length, frame0_idx=0)
+
+            audio_emb = audio_emb.unsqueeze(0)
+            audio_emb_neg = torch.zeros_like(audio_emb)
+            positive = node_helpers.conditioning_set_values(positive, {"audio_embed": audio_emb})
+            negative = node_helpers.conditioning_set_values(negative, {"audio_embed": audio_emb_neg})
+        else:
+            # If no audio embedding, leave as none, model code handles it
+            pass
+
+        if start_images is not None:
+            start_image_resized = comfy.utils.common_upscale(
+                start_images[:length].movedim(-1, 1), width, height, "bilinear", "center"
+            ).movedim(1, -1)
+
+            image = torch.ones(
+                (length, height, width, start_image_resized.shape[-1]),
+                device=start_image_resized.device,
+                dtype=start_image_resized.dtype,
+            ) * 0.5
+            image[:start_image_resized.shape[0]] = start_image_resized
+            concat_latent_image = vae.encode(image[:, :, :, :3])
+
+            pixel_frames = (latent_t - 1) * 4 + 1
+            mask = torch.ones(
+                (1, pixel_frames, latent_height, latent_width),
+                device=start_images.device,
+                dtype=start_images.dtype,
+            )
+            frames_with_image = min(start_images.shape[0], pixel_frames)
+            mask[:, :frames_with_image] = 0.0
+
+            start_mask_repeated = mask[:, 0:1].repeat(1, 4, 1, 1)
+            mask_middle = mask[:, 1:]
+            mask = torch.cat([start_mask_repeated, mask_middle], dim=1)
+            num_groups = mask.shape[1] // 4
+            mask = mask[:, :num_groups * 4]
+            mask = mask.view(1, num_groups, 4, latent_height, latent_width)
+            mask = mask.transpose(1, 2)
+
+            conditioning_updates = {
+                "concat_latent_image": concat_latent_image,
+                "concat_mask": mask,
+            }
+            positive = node_helpers.conditioning_set_values(positive, conditioning_updates)
+            negative = node_helpers.conditioning_set_values(negative, conditioning_updates)
+
+        out_latent = {}
+        out_latent["samples"] = latent
+        return io.NodeOutput(positive, negative, out_latent)
+
 
 NODE_CLASS_MAPPINGS = {
     "WanEx_I2VCustomEmbeds": WanEx_I2VCustomEmbeds,
@@ -1028,6 +1141,7 @@ NODE_CLASS_MAPPINGS = {
     "WanEx_ImageEmbedsPreview": WanEx_ImageEmbedsPreview,
     "WanEx_ConditioningEmbedsPreview": WanEx_ConditioningEmbedsPreview,
     "WanEx_PainterMotionAmplitude": WanEx_PainterMotionAmplitude,
+    "WanEx_HuMoImageToVideo": WanEx_HuMoImageToVideo,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1037,4 +1151,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanEx_ImageEmbedsPreview": "WanEx ImageEmbedsPreview",
     "WanEx_ConditioningEmbedsPreview": "WanEx ConditioningEmbedsPreview",
     "WanEx_PainterMotionAmplitude": "WanEx PainterMotionAmplitude",
+    "WanEx_HuMoImageToVideo": "WanEx HuMoImageToVideo",
 }
