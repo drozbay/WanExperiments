@@ -6,6 +6,8 @@ from comfy_api.latest import io
 import node_helpers
 import torch
 
+_KORNIA_MODULE = None
+
 class WanEx_I2VCustomEmbeds:
     """Direct control over concat_latent_image and concat_mask for Wan I2V models. Supports custom temporal masks and advanced conditioning workflows."""
 
@@ -1151,6 +1153,687 @@ class WanEx_HuMoImageToVideo(io.ComfyNode):
         return io.NodeOutput(positive, negative, out_latent)
 
 
+# Based on WanContextWindowsManual in ComfyUI core
+class WanEx_ContextWindowsAdvanced:
+    """
+    Advanced context windows node for WAN models with additional features:
+    - cond_retain_index_list: Preserve specific frame indices (e.g., initial image) in conditioning across all windows
+    - split_conds_to_windows: Split multiple conditionings to different windows based on region
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        import comfy.context_windows
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "context_length": ("INT", {
+                    "default": 81, "min": 1, "max": nodes.MAX_RESOLUTION, "step": 4,
+                    "tooltip": "The length of the context window in frames (will be converted to latent space)."
+                }),
+                "context_overlap": ("INT", {
+                    "default": 30, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 4,
+                    "tooltip": "The overlap between context windows in frames."
+                }),
+                "context_schedule": (["static_standard", "uniform_standard", "uniform_looped", "batched"], {
+                    "default": "static_standard",
+                    "tooltip": "The scheduling strategy for context windows."
+                }),
+                "context_stride": ("INT", {
+                    "default": 1, "min": 1, "max": 16,
+                    "tooltip": "The stride of the context window; only applicable to uniform schedules."
+                }),
+                "closed_loop": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Whether to close the context window loop; only applicable to looped schedules."
+                }),
+                "fuse_method": (["pyramid", "flat", "relative", "overlap-linear"], {
+                    "default": "pyramid",
+                    "tooltip": "The method to use to fuse/blend overlapping context windows."
+                }),
+                "freenoise": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Whether to apply FreeNoise noise shuffling, improves window blending."
+                }),
+            },
+            "optional": {
+                "cond_retain_index_list": ("STRING", {
+                    "default": "",
+                    "tooltip": "Comma-separated list of latent frame indices to retain in conditioning for each window. "
+                              "For example, '0' will preserve the initial/start image conditioning in every window. "
+                              "Use '0,1' to retain first two frames, etc."
+                }),
+                "split_conds_to_windows": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Whether to split multiple conditionings (created by ConditioningCombine) to each window "
+                              "based on region index. Useful for applying different prompts to different parts of the video."
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "apply_context_windows"
+    CATEGORY = "WanExperiments"
+
+    def apply_context_windows(self, model, context_length, context_overlap, context_schedule, context_stride,
+                               closed_loop, fuse_method, freenoise,
+                               cond_retain_index_list="", split_conds_to_windows=False):
+        import comfy.context_windows
+
+        # Convert frame counts to latent space (WAN uses 4:1 temporal compression)
+        latent_context_length = max(((context_length - 1) // 4) + 1, 1)
+        latent_context_overlap = max(((context_overlap - 1) // 4) + 1, 0)
+
+        # Clone the model
+        model = model.clone()
+
+        # Create context handler with all features enabled
+        model.model_options["context_handler"] = comfy.context_windows.IndexListContextHandler(
+            context_schedule=comfy.context_windows.get_matching_context_schedule(context_schedule),
+            fuse_method=comfy.context_windows.get_matching_fuse_method(fuse_method),
+            context_length=latent_context_length,
+            context_overlap=latent_context_overlap,
+            context_stride=context_stride,
+            closed_loop=closed_loop,
+            dim=2,  # WAN models use dim=2 for temporal
+            freenoise=freenoise,
+            cond_retain_index_list=cond_retain_index_list,
+            split_conds_to_windows=split_conds_to_windows
+        )
+
+        # make memory usage calculation only take into account the context window latents
+        comfy.context_windows.create_prepare_sampling_wrapper(model)
+        if freenoise:
+            comfy.context_windows.create_sampler_sample_wrapper(model)
+
+        return (model,)
+
+def _ensure_kornia_available():
+    """Lazy import Kornia so optional installs can raise a guided error."""
+    global _KORNIA_MODULE
+    if _KORNIA_MODULE is None:
+        try:
+            import kornia  # pylint: disable=import-error
+            _KORNIA_MODULE = kornia
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "WanEx_VideoColorMatch requires the optional dependency 'kornia'. "
+                "Install it with `pip install kornia` to use this node."
+            ) from exc
+    return _KORNIA_MODULE
+
+
+def _resolve_frame_index(num_frames, requested_index):
+    """Clamp or wrap a requested frame index for reference batches."""
+    if num_frames <= 1:
+        return 0
+    resolved = requested_index
+    if resolved < 0:
+        resolved = num_frames + resolved
+    resolved = max(0, min(num_frames - 1, resolved))
+    return resolved
+
+# Modified from ImageColorMatch node in ComfyUI Essentials node pack (https://github.com/cubiq/ComfyUI_essentials)
+class WanEx_VideoColorMatch:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "reference": ("IMAGE",),
+                "target_index": ("INT", {
+                    "default": 0, "min": 0, "max": 10000, "step": 1,
+                    "tooltip": "Index of the frame in the batch to use for computing color matching metrics."
+                }),
+                "reference_index": ("INT", {
+                    "default": -1, "min": -1, "max": 10000, "step": 1,
+                    "tooltip": "Frame index to sample from the reference batch (-1 selects the last frame)."
+                }),
+                "color_space": (["LAB", "YCbCr", "RGB", "LUV", "YUV", "XYZ"],),
+                "factor": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "device": (["auto", "cpu", "gpu"],),
+                "batch_size": ("INT", {
+                    "default": 0, "min": 0, "max": 1024, "step": 1,
+                    "tooltip": "Processing batch size for memory efficiency. 0 = process all at once."
+                }),
+            },
+            "optional": {
+                "reference_mask": ("MASK",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "execute"
+    CATEGORY = "WanExperiments"
+    DESCRIPTION = "Applies uniform color matching across a video batch using a single target frame for metric computation."
+
+    def execute(self, images, reference, target_index, reference_index, color_space, factor, device, batch_size, reference_mask=None):
+        _ensure_kornia_available()
+
+        if "gpu" == device:
+            device = comfy.model_management.get_torch_device()
+        elif "auto" == device:
+            device = comfy.model_management.intermediate_device()
+        else:
+            device = 'cpu'
+
+        # Validate target_index
+        num_frames = images.shape[0]
+        if target_index >= num_frames:
+            target_index = num_frames - 1
+
+        # Permute to [B, C, H, W] format
+        images_perm = images.permute([0, 3, 1, 2])
+        reference_perm = reference.permute([0, 3, 1, 2]).to(device)
+        ref_frame_count = reference_perm.shape[0]
+        ref_idx = _resolve_frame_index(ref_frame_count, reference_index)
+        reference_perm = reference_perm[ref_idx:ref_idx+1]
+
+        # Process reference_mask if provided
+        if reference_mask is not None:
+            assert reference_mask.ndim == 3, f"Expected reference_mask to have 3 dimensions, but got {reference_mask.ndim}"
+            assert reference_mask.shape[0] == ref_frame_count, f"Frame count mismatch: reference_mask has {reference_mask.shape[0]} frames, but reference has {ref_frame_count}"
+
+            reference_mask = reference_mask[ref_idx:ref_idx+1]
+
+            reference_mask = reference_mask.unsqueeze(1).to(device)
+            reference_mask = (reference_mask > 0.5).float()
+
+            if reference_mask.shape[2:] != reference_perm.shape[2:]:
+                reference_mask = comfy.utils.common_upscale(
+                    reference_mask,
+                    reference_perm.shape[3], reference_perm.shape[2],
+                    upscale_method='bicubic',
+                    crop='center'
+                )
+
+        if batch_size == 0 or batch_size > num_frames:
+            batch_size = num_frames
+
+        # Convert reference to target color space
+        ref_converted = self._convert_to_color_space(reference_perm, color_space)
+        reference_mean, reference_std = self._compute_mean_std(ref_converted, reference_mask)
+
+        # Get the target frame and compute its statistics
+        target_frame = images_perm[target_index:target_index+1].to(device)
+        target_converted = self._convert_to_color_space(target_frame, color_space)
+        target_mean, target_std = self._compute_mean_std(target_converted)
+
+        # Process images in batches using the SAME target statistics for all frames
+        image_batches = torch.split(images_perm, batch_size, dim=0)
+        output = []
+
+        for img_batch in image_batches:
+            img_batch = img_batch.to(device)
+
+            # Convert to color space
+            img_converted = self._convert_to_color_space(img_batch, color_space)
+
+            # Apply color matching using the target frame's statistics (uniform across batch)
+            # Formula: (image - target_mean) / target_std * reference_std + reference_mean
+            matched = torch.nan_to_num((img_converted - target_mean) / target_std) * torch.nan_to_num(reference_std) + reference_mean
+            matched = factor * matched + (1 - factor) * img_converted
+
+            # Convert back to RGB
+            matched = self._convert_from_color_space(matched, color_space)
+
+            out = matched.permute([0, 2, 3, 1]).clamp(0, 1).to(comfy.model_management.intermediate_device())
+            output.append(out)
+
+        output = torch.cat(output, dim=0)
+        return (output,)
+
+    def _convert_to_color_space(self, tensor, color_space):
+        kornia = _ensure_kornia_available()
+        if color_space == "LAB":
+            return kornia.color.rgb_to_lab(tensor)
+        elif color_space == "YCbCr":
+            return kornia.color.rgb_to_ycbcr(tensor)
+        elif color_space == "LUV":
+            return kornia.color.rgb_to_luv(tensor)
+        elif color_space == "YUV":
+            return kornia.color.rgb_to_yuv(tensor)
+        elif color_space == "XYZ":
+            return kornia.color.rgb_to_xyz(tensor)
+        return tensor  # RGB
+
+    def _convert_from_color_space(self, tensor, color_space):
+        kornia = _ensure_kornia_available()
+        if color_space == "LAB":
+            return kornia.color.lab_to_rgb(tensor)
+        elif color_space == "YCbCr":
+            return kornia.color.ycbcr_to_rgb(tensor)
+        elif color_space == "LUV":
+            return kornia.color.luv_to_rgb(tensor)
+        elif color_space == "YUV":
+            return kornia.color.yuv_to_rgb(tensor)
+        elif color_space == "XYZ":
+            return kornia.color.xyz_to_rgb(tensor)
+        return tensor  # RGB
+
+    def _compute_mean_std(self, tensor, mask=None):
+        if mask is not None:
+            masked_tensor = tensor * mask
+            mask_sum = mask.sum(dim=[2, 3], keepdim=True)
+            mask_sum = torch.clamp(mask_sum, min=1e-6)
+            mean = torch.nan_to_num(masked_tensor.sum(dim=[2, 3], keepdim=True) / mask_sum)
+            std = torch.sqrt(torch.nan_to_num(((masked_tensor - mean) ** 2 * mask).sum(dim=[2, 3], keepdim=True) / mask_sum))
+        else:
+            mean = tensor.mean(dim=[2, 3], keepdim=True)
+            std = tensor.std(dim=[2, 3], keepdim=True)
+        return mean, std
+
+
+class WanEx_VideoContrastMatch:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "reference": ("IMAGE",),
+                "target_index": ("INT", {
+                    "default": 0, "min": 0, "max": 10000, "step": 1,
+                    "tooltip": "Frame index in the batch that defines the contrast correction mapping."
+                }),
+                "reference_index": ("INT", {
+                    "default": -1, "min": -1, "max": 10000, "step": 1,
+                    "tooltip": "Frame index to sample from the reference batch (-1 selects the last frame)."
+                }),
+                "contrast_space": (["LAB", "YCbCr", "YUV"], {
+                    "default": "LAB",
+                    "tooltip": "Color space used to extract the luminance channel for contrast matching."
+                }),
+                "technique": ([
+                    "global_mean_std",
+                    "percentile_levels",
+                    "histogram"
+                ], {
+                    "default": "global_mean_std",
+                    "tooltip": "Select the contrast/levels matching algorithm."
+                }),
+                "match_strength": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Blend between original (0.0) and fully matched result (1.0)."
+                }),
+                "device": (["auto", "cpu", "gpu"],),
+                "batch_size": ("INT", {
+                    "default": 0, "min": 0, "max": 1024, "step": 1,
+                    "tooltip": "Processing batch size for memory efficiency. 0 = process all frames at once."
+                }),
+            },
+            "optional": {
+                "reference_mask": ("MASK", {
+                    "tooltip": "Optional mask to limit which pixels in the reference contribute to statistics."
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "execute"
+    CATEGORY = "WanExperiments"
+    DESCRIPTION = "Matches video contrast/levels to a reference using a chosen luminance technique and propagates the correction across frames."
+
+    def execute(self, images, reference, target_index, reference_index, contrast_space, technique, match_strength, device, batch_size, reference_mask=None):
+        _ensure_kornia_available()
+
+        if device == "gpu":
+            device = comfy.model_management.get_torch_device()
+        elif device == "auto":
+            device = comfy.model_management.intermediate_device()
+        else:
+            device = "cpu"
+
+        num_frames = images.shape[0]
+        if target_index >= num_frames:
+            target_index = num_frames - 1
+
+        images_perm = images.permute(0, 3, 1, 2)
+        reference_perm = reference.permute(0, 3, 1, 2).to(device)
+        ref_frame_count = reference_perm.shape[0]
+        ref_idx = _resolve_frame_index(ref_frame_count, reference_index)
+        reference_perm = reference_perm[ref_idx:ref_idx+1]
+
+        ref_mask_tensor = None
+        if reference_mask is not None:
+            assert reference_mask.ndim == 3, "reference_mask must be [frames, height, width]"
+            assert reference_mask.shape[0] == ref_frame_count, "reference_mask frame count must match reference"
+            reference_mask = reference_mask[ref_idx:ref_idx+1]
+            ref_mask_tensor = reference_mask.unsqueeze(1).to(device)
+            ref_mask_tensor = (ref_mask_tensor > 0.5).float()
+            if ref_mask_tensor.shape[2:] != reference_perm.shape[2:]:
+                ref_mask_tensor = comfy.utils.common_upscale(
+                    ref_mask_tensor,
+                    reference_perm.shape[3], reference_perm.shape[2],
+                    upscale_method="bicubic",
+                    crop="center"
+                )
+
+        target_frame = images_perm[target_index:target_index + 1].to(device)
+
+        reference_color = self._convert_to_color_space(reference_perm, contrast_space)
+        target_color = self._convert_to_color_space(target_frame, contrast_space)
+
+        reference_lum = self._extract_luminance(reference_color, contrast_space)
+        target_lum = self._extract_luminance(target_color, contrast_space)
+
+        params = self._build_correction_params(
+            reference_lum,
+            target_lum,
+            ref_mask_tensor,
+            technique
+        )
+
+        if batch_size == 0 or batch_size > num_frames:
+            batch_size = num_frames
+
+        output_batches = []
+        for img_batch in torch.split(images_perm, batch_size, dim=0):
+            img_batch = img_batch.to(device)
+            batch_color = self._convert_to_color_space(img_batch, contrast_space)
+            batch_lum = self._extract_luminance(batch_color, contrast_space)
+            matched_lum = self._apply_luminance_correction(batch_lum, params, technique)
+            batch_color = self._inject_luminance(batch_color, matched_lum, contrast_space)
+            corrected = self._convert_from_color_space(batch_color, contrast_space)
+            blended = (match_strength * corrected) + ((1.0 - match_strength) * img_batch)
+            blended = blended.permute(0, 2, 3, 1).clamp(0, 1)
+            output_batches.append(blended.to(comfy.model_management.intermediate_device()))
+
+        output = torch.cat(output_batches, dim=0)
+        return (output,)
+
+    def _convert_to_color_space(self, tensor, color_space):
+        kornia = _ensure_kornia_available()
+        if color_space == "LAB":
+            return kornia.color.rgb_to_lab(tensor)
+        elif color_space == "YCbCr":
+            return kornia.color.rgb_to_ycbcr(tensor)
+        elif color_space == "YUV":
+            return kornia.color.rgb_to_yuv(tensor)
+        return tensor
+
+    def _convert_from_color_space(self, tensor, color_space):
+        kornia = _ensure_kornia_available()
+        if color_space == "LAB":
+            return kornia.color.lab_to_rgb(tensor)
+        elif color_space == "YCbCr":
+            return kornia.color.ycbcr_to_rgb(tensor)
+        elif color_space == "YUV":
+            return kornia.color.yuv_to_rgb(tensor)
+        return tensor
+
+    def _extract_luminance(self, tensor, color_space):
+        if color_space in ("LAB", "YCbCr", "YUV"):
+            return tensor[:, :1, :, :]
+        # Fallback to perceptual luminance for already-RGB tensors
+        return (0.2126 * tensor[:, 0:1] + 0.7152 * tensor[:, 1:2] + 0.0722 * tensor[:, 2:3])
+
+    def _inject_luminance(self, tensor, luminance, color_space):
+        if color_space in ("LAB", "YCbCr", "YUV"):
+            tensor = tensor.clone()
+            tensor[:, :1, :, :] = luminance
+            return tensor
+        # Approximate injection by scaling RGB channels to match luminance ratio
+        base_lum = self._extract_luminance(tensor, "RGB")
+        ratio = torch.nan_to_num(luminance / torch.clamp(base_lum, min=1e-4))
+        return torch.clamp(tensor * ratio, 0.0, 1.0)
+
+    def _build_correction_params(self, reference_lum, target_lum, reference_mask, technique):
+        if technique == "global_mean_std":
+            ref_mean, ref_std = self._masked_mean_std(reference_lum, reference_mask)
+            tgt_mean, tgt_std = self._masked_mean_std(target_lum)
+            return {
+                "ref_mean": ref_mean,
+                "ref_std": torch.clamp(ref_std, min=1e-4),
+                "tgt_mean": tgt_mean,
+                "tgt_std": torch.clamp(tgt_std, min=1e-4)
+            }
+        elif technique == "percentile_levels":
+            ref_low, ref_high = self._masked_percentiles(reference_lum, reference_mask)
+            tgt_low, tgt_high = self._masked_percentiles(target_lum)
+            return {
+                "ref_low": ref_low,
+                "ref_high": torch.maximum(ref_high, ref_low + 1e-4),
+                "tgt_low": tgt_low,
+                "tgt_high": torch.maximum(tgt_high, tgt_low + 1e-4)
+            }
+        elif technique == "histogram":
+            mapping = self._build_histogram_mapping(target_lum, reference_lum, reference_mask)
+            return {"mapping": mapping}
+        else:
+            raise ValueError(f"Unsupported technique: {technique}")
+
+    def _apply_luminance_correction(self, tensor, params, technique):
+        if technique == "global_mean_std":
+            corrected = (tensor - params["tgt_mean"]) / params["tgt_std"]
+            corrected = corrected * params["ref_std"] + params["ref_mean"]
+            return torch.clamp(corrected, 0.0, 1.0)
+        elif technique == "percentile_levels":
+            normalized = (tensor - params["tgt_low"]) / (params["tgt_high"] - params["tgt_low"])
+            normalized = torch.clamp(normalized, 0.0, 1.0)
+            scaled = normalized * (params["ref_high"] - params["ref_low"]) + params["ref_low"]
+            return torch.clamp(scaled, 0.0, 1.0)
+        elif technique == "histogram":
+            return self._apply_histogram_mapping(tensor, params["mapping"])
+        else:
+            return tensor
+
+    def _masked_mean_std(self, tensor, mask=None):
+        if mask is not None:
+            masked = tensor * mask
+            denom = torch.clamp(mask.sum(dim=[2, 3], keepdim=True), min=1e-6)
+            mean = masked.sum(dim=[2, 3], keepdim=True) / denom
+            var = ((masked - mean) ** 2 * mask).sum(dim=[2, 3], keepdim=True) / denom
+            std = torch.sqrt(torch.clamp(var, min=1e-6))
+        else:
+            mean = tensor.mean(dim=[2, 3], keepdim=True)
+            std = tensor.std(dim=[2, 3], keepdim=True)
+        return mean, std
+
+    def _masked_percentiles(self, tensor, mask=None, low=0.02, high=0.98):
+        flat = tensor.flatten()
+        if mask is not None:
+            mask_flat = mask.flatten()
+            flat = flat[mask_flat > 0.5]
+        if flat.numel() == 0:
+            flat = tensor.flatten()
+        flat = torch.sort(flat)[0]
+        low_idx = max(int((flat.numel() - 1) * low), 0)
+        high_idx = max(int((flat.numel() - 1) * high), 0)
+        return flat[low_idx], flat[high_idx]
+
+    def _build_histogram_mapping(self, target_lum, reference_lum, reference_mask=None, bins=256):
+        target_flat = target_lum.flatten()
+        reference_flat = reference_lum.flatten()
+        if reference_mask is not None:
+            mask_flat = reference_mask.flatten()
+            reference_flat = reference_flat[mask_flat > 0.5]
+        if reference_flat.numel() == 0:
+            reference_flat = reference_lum.flatten()
+        target_cdf = self._cdf_from_tensor(target_flat, bins)
+        reference_cdf = self._cdf_from_tensor(reference_flat, bins)
+        mapping = torch.zeros(bins, device=target_lum.device)
+        ref_idx = 0
+        for bin_idx in range(bins):
+            src_val = target_cdf[bin_idx]
+            while ref_idx < bins - 1 and reference_cdf[ref_idx] < src_val:
+                ref_idx += 1
+            mapping[bin_idx] = ref_idx / (bins - 1)
+        return mapping
+
+    def _cdf_from_tensor(self, tensor, bins):
+        hist = torch.histc(tensor, bins=bins, min=0.0, max=1.0)
+        cdf = torch.cumsum(hist, dim=0)
+        total = torch.clamp(cdf[-1], min=1e-6)
+        return cdf / total
+
+    def _apply_histogram_mapping(self, tensor, mapping):
+        bins = mapping.shape[0]
+        idx = torch.clamp((tensor * (bins - 1)).long(), 0, bins - 1)
+        matched = mapping[idx]
+        return torch.clamp(matched, 0.0, 1.0)
+
+
+class WanEx_ContextWindowsPreview:
+    """
+    Preview how context windows will be laid out for a given configuration.
+    Prints window layout to console and returns preview text.
+    Pass-through for model and conditioning inputs.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "total_frames": ("INT", {
+                    "default": 81, "min": 1, "max": nodes.MAX_RESOLUTION, "step": 4,
+                    "tooltip": "Total video frames (will be converted to latent frames)."
+                }),
+                "context_length": ("INT", {
+                    "default": 81, "min": 1, "max": nodes.MAX_RESOLUTION, "step": 4,
+                    "tooltip": "Context window size in frames."
+                }),
+                "context_overlap": ("INT", {
+                    "default": 30, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 4,
+                    "tooltip": "Overlap between windows in frames."
+                }),
+                "context_schedule": (["static_standard", "batched"], {
+                    "default": "static_standard",
+                    "tooltip": "Window scheduling strategy."
+                }),
+            },
+            "optional": {
+                "model": ("MODEL", {"tooltip": "Pass-through model input."}),
+                "positive": ("CONDITIONING", {"tooltip": "Pass-through. Count used for split preview."}),
+                "negative": ("CONDITIONING", {"tooltip": "Pass-through."}),
+                "split_conds_to_windows": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Preview how conditioning would be split across windows."
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "STRING")
+    RETURN_NAMES = ("model", "positive", "negative", "preview_text")
+    FUNCTION = "preview_windows"
+    CATEGORY = "WanExperiments"
+    OUTPUT_NODE = True
+
+    def _calculate_windows_static(self, num_frames, context_length, context_overlap):
+        """Replicate static_standard window calculation."""
+        if num_frames <= context_length:
+            return [list(range(num_frames))]
+
+        windows = []
+        delta = context_length - context_overlap
+
+        for start_idx in range(0, num_frames, delta):
+            ending = start_idx + context_length
+            if ending >= num_frames:
+                # Shift back to maintain context_length
+                final_start_idx = start_idx - (ending - num_frames)
+                windows.append(list(range(final_start_idx, final_start_idx + context_length)))
+                break
+            windows.append(list(range(start_idx, start_idx + context_length)))
+
+        return windows
+
+    def _calculate_windows_batched(self, num_frames, context_length):
+        """Replicate batched window calculation."""
+        if num_frames <= context_length:
+            return [list(range(num_frames))]
+
+        windows = []
+        for start_idx in range(0, num_frames, context_length):
+            windows.append(list(range(start_idx, min(start_idx + context_length, num_frames))))
+        return windows
+
+    def _get_region_index(self, index_list, total_frames, num_regions):
+        """Calculate which conditioning region a window maps to."""
+        center_ratio = (min(index_list) + max(index_list)) / (2 * total_frames)
+        region_idx = int(center_ratio * num_regions)
+        return min(max(region_idx, 0), num_regions - 1)
+
+    def preview_windows(self, total_frames, context_length, context_overlap, context_schedule,
+                        model=None, positive=None, negative=None, split_conds_to_windows=False):
+
+        # Convert to latent frames (WAN 4:1 compression)
+        latent_total = max(((total_frames - 1) // 4) + 1, 1)
+        latent_context = max(((context_length - 1) // 4) + 1, 1)
+        latent_overlap = max(((context_overlap - 1) // 4) + 1, 0)
+
+        # Calculate windows
+        if context_schedule == "static_standard":
+            windows = self._calculate_windows_static(latent_total, latent_context, latent_overlap)
+        elif context_schedule == "batched":
+            windows = self._calculate_windows_batched(latent_total, latent_context)
+        else:
+            windows = self._calculate_windows_static(latent_total, latent_context, latent_overlap)
+
+        # Build preview text
+        lines = []
+        lines.append("=" * 50)
+        lines.append("Context Windows Preview")
+        lines.append("=" * 50)
+        lines.append(f"Video frames: {total_frames} → Latent frames: {latent_total}")
+        lines.append(f"Context: {context_length} frames → {latent_context} latent")
+        lines.append(f"Overlap: {context_overlap} frames → {latent_overlap} latent")
+        lines.append(f"Schedule: {context_schedule}")
+
+        if context_schedule == "static_standard":
+            delta = latent_context - latent_overlap
+            lines.append(f"Step size (delta): {delta} latent frames")
+
+        lines.append("")
+        lines.append("-" * 50)
+
+        prev_window = None
+        for i, window in enumerate(windows):
+            win_start = min(window)
+            win_end = max(window)
+            win_len = len(window)
+
+            overlap_info = ""
+            if prev_window is not None:
+                overlap_frames = set(prev_window) & set(window)
+                if overlap_frames:
+                    overlap_info = f" | overlap: {len(overlap_frames)} frames [{min(overlap_frames)}-{max(overlap_frames)}]"
+
+            lines.append(f"Window {i+1}: frames [{win_start}-{win_end}] ({win_len} frames){overlap_info}")
+            prev_window = window
+
+        lines.append("-" * 50)
+        lines.append(f"Total: {len(windows)} context window(s)")
+
+        # Conditioning split preview
+        if split_conds_to_windows and positive is not None:
+            num_conds = len(positive)
+            if num_conds > 1:
+                lines.append("")
+                lines.append("=" * 50)
+                lines.append("Conditioning Split Preview")
+                lines.append("=" * 50)
+                lines.append(f"Positive conditionings: {num_conds}")
+                lines.append("")
+
+                for i, window in enumerate(windows):
+                    center_ratio = (min(window) + max(window)) / (2 * latent_total)
+                    region_idx = self._get_region_index(window, latent_total, num_conds)
+                    lines.append(f"  Window {i+1} (center: {center_ratio:.2f}) → conditioning [{region_idx}]")
+            else:
+                lines.append("")
+                lines.append("(split_conds_to_windows enabled but only 1 conditioning provided)")
+
+        lines.append("=" * 50)
+
+        preview_text = "\n".join(lines)
+
+        # Print to console
+        print(preview_text)
+
+        return (model, positive, negative, preview_text)
+
+
 NODE_CLASS_MAPPINGS = {
     "WanEx_I2VCustomEmbeds": WanEx_I2VCustomEmbeds,
     "WanEx_BindweaveSubjectToVid": WanEx_BindweaveSubjectToVid,
@@ -1159,6 +1842,10 @@ NODE_CLASS_MAPPINGS = {
     "WanEx_ConditioningEmbedsPreview": WanEx_ConditioningEmbedsPreview,
     "WanEx_PainterMotionAmplitude": WanEx_PainterMotionAmplitude,
     "WanEx_HuMoImageToVideo": WanEx_HuMoImageToVideo,
+    "WanEx_ContextWindowsAdvanced": WanEx_ContextWindowsAdvanced,
+    "WanEx_ContextWindowsPreview": WanEx_ContextWindowsPreview,
+    "WanEx_VideoColorMatch": WanEx_VideoColorMatch,
+    "WanEx_VideoContrastMatch": WanEx_VideoContrastMatch,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1169,4 +1856,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanEx_ConditioningEmbedsPreview": "WanEx ConditioningEmbedsPreview",
     "WanEx_PainterMotionAmplitude": "WanEx PainterMotionAmplitude",
     "WanEx_HuMoImageToVideo": "WanEx HuMoImageToVideo",
+    "WanEx_ContextWindowsAdvanced": "WanEx Context Windows",
+    "WanEx_ContextWindowsPreview": "WanEx Context Windows Preview",
+    "WanEx_VideoColorMatch": "WanEx Video Color Match",
+    "WanEx_VideoContrastMatch": "WanEx Video Contrast Match",
 }

@@ -12,4 +12,8 @@ These are quick partially vibe-coded nodes that I use for testing things for Wan
 - **WanEx_HuMoImageToVideo** – Extends capabilities compared to WanHuMoImageToVideo. Allows for providing start/end images in the node directly for convenience (could also use the I2VCustomEmbeds node for more control) and critically allows for providing a batch of reference images instead of only one.
 
 License: GNU GPLv3
-PainterI2V code licensed under MIT License (c) princepainter
+
+Attributions for derived code:
+[PainterI2V](https://github.com/princepainter/ComfyUI-PainterI2V) licensed under MIT License (c) princepainter
+[ComfyUI_essentials](https://github.com/cubiq/ComfyUI_essentials) licensed under the MIT License (c) cubiq
+
