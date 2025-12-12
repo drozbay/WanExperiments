@@ -1172,11 +1172,11 @@ class WanEx_ContextWindowsAdvanced:
                     "tooltip": "The length of the context window in frames (will be converted to latent space)."
                 }),
                 "context_overlap": ("INT", {
-                    "default": 30, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 4,
+                    "default": 29, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 1,
                     "tooltip": "The overlap between context windows in frames."
                 }),
-                "context_schedule": (["static_standard", "uniform_standard", "uniform_looped", "batched"], {
-                    "default": "static_standard",
+                "context_schedule": (["standard_static", "standard_uniform", "looped_uniform", "batched"], {
+                    "default": "standard_static",
                     "tooltip": "The scheduling strategy for context windows."
                 }),
                 "context_stride": ("INT", {
@@ -1697,8 +1697,8 @@ class WanEx_ContextWindowsPreview:
                     "default": 30, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 4,
                     "tooltip": "Overlap between windows in frames."
                 }),
-                "context_schedule": (["static_standard", "batched"], {
-                    "default": "static_standard",
+                "context_schedule": (["standard_static", "batched"], {
+                    "default": "standard_static",
                     "tooltip": "Window scheduling strategy."
                 }),
             },
@@ -1720,7 +1720,7 @@ class WanEx_ContextWindowsPreview:
     OUTPUT_NODE = True
 
     def _calculate_windows_static(self, num_frames, context_length, context_overlap):
-        """Replicate static_standard window calculation."""
+        """Replicate standard_static window calculation."""
         if num_frames <= context_length:
             return [list(range(num_frames))]
 
@@ -1763,7 +1763,7 @@ class WanEx_ContextWindowsPreview:
         latent_overlap = max(((context_overlap - 1) // 4) + 1, 0)
 
         # Calculate windows
-        if context_schedule == "static_standard":
+        if context_schedule == "standard_static":
             windows = self._calculate_windows_static(latent_total, latent_context, latent_overlap)
         elif context_schedule == "batched":
             windows = self._calculate_windows_batched(latent_total, latent_context)
@@ -1780,7 +1780,7 @@ class WanEx_ContextWindowsPreview:
         lines.append(f"Overlap: {context_overlap} frames → {latent_overlap} latent")
         lines.append(f"Schedule: {context_schedule}")
 
-        if context_schedule == "static_standard":
+        if context_schedule == "standard_static":
             delta = latent_context - latent_overlap
             lines.append(f"Step size (delta): {delta} latent frames")
 
