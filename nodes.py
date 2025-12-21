@@ -1029,6 +1029,7 @@ class WanEx_HuMoImageToVideo(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="WanEx_HuMoImageToVideo",
+            display_name="WanEx HuMoImageToVideo",
             category="WanExperiments",
             inputs=[
                 io.Conditioning.Input("positive"),
@@ -1153,6 +1154,217 @@ class WanEx_HuMoImageToVideo(io.ComfyNode):
         return io.NodeOutput(positive, negative, out_latent)
 
 
+import logging
+
+
+class ExplicitMappingContextHandler:
+    """
+    Context handler with explicit conditioning-to-window mapping.
+
+    Provides explicit control over which conditioning applies to which window
+    via a string like "0,1,2,3" instead of automatic center_ratio-based distribution.
+
+    Mapping rules:
+    - "0,1,2,3" maps cond[0] to window 0, cond[1] to window 1, etc.
+    - If more windows than mapping entries: repeat the last conditioning
+    - If mapping index exceeds available conditionings: clamp to last valid
+    - Repeats allowed: "0,0,1,1" uses cond 0 for windows 0-1, cond 1 for windows 2-3
+    """
+
+    def __init__(self, explicit_cond_mapping: str = "", **kwargs):
+        import comfy.context_windows
+        # Store mapping before creating base handler
+        self._explicit_cond_mapping = self._parse_mapping(explicit_cond_mapping)
+        self._current_window_idx = 0
+
+        # Create base handler with all the kwargs
+        self._base_handler = comfy.context_windows.IndexListContextHandler(**kwargs)
+
+        # Copy attributes from base handler for compatibility
+        self.context_schedule = self._base_handler.context_schedule
+        self.fuse_method = self._base_handler.fuse_method
+        self.context_length = self._base_handler.context_length
+        self.context_overlap = self._base_handler.context_overlap
+        self.context_stride = self._base_handler.context_stride
+        self.closed_loop = self._base_handler.closed_loop
+        self.dim = self._base_handler.dim
+        self._step = self._base_handler._step
+        self.freenoise = self._base_handler.freenoise
+        self.cond_retain_index_list = self._base_handler.cond_retain_index_list
+        self.split_conds_to_windows = self._base_handler.split_conds_to_windows
+        self.callbacks = self._base_handler.callbacks
+
+    @staticmethod
+    def _parse_mapping(mapping_str: str) -> list:
+        """
+        Parse mapping string like "0,1,2,3" into list of integers.
+        Returns None if empty/invalid (fall back to automatic behavior).
+        """
+        if not mapping_str or not mapping_str.strip():
+            return None
+
+        try:
+            parts = [p.strip() for p in mapping_str.split(",") if p.strip()]
+            indices = [int(p) for p in parts]
+            if any(i < 0 for i in indices):
+                raise ValueError("Conditioning indices cannot be negative")
+            return indices if indices else None
+        except ValueError as e:
+            logging.warning(f"Invalid explicit_cond_mapping '{mapping_str}': {e}. Falling back to automatic.")
+            return None
+
+    def _get_explicit_cond_index(self, window_idx: int, num_conds: int) -> int:
+        """
+        Get the conditioning index for a specific window based on explicit mapping.
+
+        Rules:
+        - If window_idx < len(mapping): use mapping[window_idx]
+        - If window_idx >= len(mapping): repeat last entry
+        - If mapped index >= num_conds: clamp to last valid conditioning
+        """
+        if not self._explicit_cond_mapping:
+            return 0
+
+        if window_idx < len(self._explicit_cond_mapping):
+            cond_idx = self._explicit_cond_mapping[window_idx]
+        else:
+            # Repeat last entry for extra windows
+            cond_idx = self._explicit_cond_mapping[-1]
+
+        return min(cond_idx, num_conds - 1)
+
+    def should_use_context(self, model, conds, x_in, timestep, model_options) -> bool:
+        return self._base_handler.should_use_context(model, conds, x_in, timestep, model_options)
+
+    def prepare_control_objects(self, control, device=None):
+        return self._base_handler.prepare_control_objects(control, device)
+
+    def set_step(self, timestep, model_options):
+        self._base_handler.set_step(timestep, model_options)
+        self._step = self._base_handler._step
+
+    def get_context_windows(self, model, x_in, model_options):
+        return self._base_handler.get_context_windows(model, x_in, model_options)
+
+    def get_resized_cond(self, cond_in, x_in, window, device=None):
+        """
+        Apply explicit mapping before delegating to base handler.
+        """
+        if cond_in is None:
+            return None
+
+        # Apply explicit mapping (takes precedence over split_conds_to_windows)
+        if self._explicit_cond_mapping and len(cond_in) > 1:
+            cond_idx = self._get_explicit_cond_index(self._current_window_idx, len(cond_in))
+            logging.info(
+                f"Explicit mapping: window {self._current_window_idx} "
+                f"(frames {window.index_list[0]}-{window.index_list[-1]}) -> conditioning [{cond_idx}]"
+            )
+            cond_in = [cond_in[cond_idx]]
+
+        # Temporarily disable split_conds_to_windows since we handled selection
+        original_split = self._base_handler.split_conds_to_windows
+        self._base_handler.split_conds_to_windows = False
+        try:
+            return self._base_handler.get_resized_cond(cond_in, x_in, window, device)
+        finally:
+            self._base_handler.split_conds_to_windows = original_split
+
+    def evaluate_context_windows(self, calc_cond_batch, model, x_in, conds, timestep,
+                                  enumerated_context_windows, model_options, device=None, first_device=None):
+        """
+        Override to track window_idx before get_resized_cond is called.
+        """
+        import comfy.context_windows
+        import comfy.model_management
+        import comfy.patcher_extension
+
+        results = []
+        for window_idx, window in enumerated_context_windows:
+            # Store current window index for use in get_resized_cond
+            self._current_window_idx = window_idx
+
+            comfy.model_management.throw_exception_if_processing_interrupted()
+
+            for callback in comfy.patcher_extension.get_all_callbacks(
+                comfy.context_windows.IndexListCallbacks.EVALUATE_CONTEXT_WINDOWS, self.callbacks
+            ):
+                callback(self, model, x_in, conds, timestep, model_options,
+                        window_idx, window, model_options, device, first_device)
+
+            model_options["transformer_options"]["context_window"] = window
+            sub_x = window.get_tensor(x_in, device)
+            sub_timestep = window.get_tensor(timestep, device, dim=0)
+            sub_conds = [self.get_resized_cond(cond, x_in, window, device) for cond in conds]
+
+            sub_conds_out = calc_cond_batch(model, sub_conds, sub_x, sub_timestep, model_options)
+            if device is not None:
+                for i in range(len(sub_conds_out)):
+                    sub_conds_out[i] = sub_conds_out[i].to(x_in.device)
+
+            results.append(comfy.context_windows.ContextResults(window_idx, sub_conds_out, sub_conds, window))
+
+        return results
+
+    def combine_context_window_results(self, x_in, sub_conds_out, sub_conds, window, window_idx,
+                                        total_windows, timestep, conds_final, counts_final, biases_final):
+        return self._base_handler.combine_context_window_results(
+            x_in, sub_conds_out, sub_conds, window, window_idx,
+            total_windows, timestep, conds_final, counts_final, biases_final
+        )
+
+    def execute(self, calc_cond_batch, model, conds, x_in, timestep, model_options):
+        """
+        Execute context window processing with explicit mapping support.
+        """
+        import comfy.context_windows
+        import comfy.patcher_extension
+
+        self.set_step(timestep, model_options)
+        context_windows = self.get_context_windows(model, x_in, model_options)
+        enumerated_context_windows = list(enumerate(context_windows))
+
+        conds_final = [torch.zeros_like(x_in) for _ in conds]
+
+        # Get fuse method name for conditional logic
+        fuse_method_name = self.fuse_method.name
+
+        if fuse_method_name == comfy.context_windows.ContextFuseMethods.RELATIVE:
+            counts_final = [torch.ones(comfy.context_windows.get_shape_for_dim(x_in, self.dim), device=x_in.device) for _ in conds]
+        else:
+            counts_final = [torch.zeros(comfy.context_windows.get_shape_for_dim(x_in, self.dim), device=x_in.device) for _ in conds]
+        biases_final = [([0.0] * x_in.shape[self.dim]) for _ in conds]
+
+        for callback in comfy.patcher_extension.get_all_callbacks(
+            comfy.context_windows.IndexListCallbacks.EXECUTE_START, self.callbacks
+        ):
+            callback(self, model, x_in, conds, timestep, model_options)
+
+        for enum_window in enumerated_context_windows:
+            results = self.evaluate_context_windows(calc_cond_batch, model, x_in, conds, timestep, [enum_window], model_options)
+            for result in results:
+                self.combine_context_window_results(
+                    x_in, result.sub_conds_out, result.sub_conds, result.window, result.window_idx,
+                    len(enumerated_context_windows), timestep, conds_final, counts_final, biases_final
+                )
+
+        try:
+            # Finalize conds
+            if fuse_method_name == comfy.context_windows.ContextFuseMethods.RELATIVE:
+                del counts_final
+                return conds_final
+            else:
+                for i in range(len(conds_final)):
+                    conds_final[i] /= counts_final[i]
+                del counts_final
+                return conds_final
+        finally:
+            for callback in comfy.patcher_extension.get_all_callbacks(
+                comfy.context_windows.IndexListCallbacks.EXECUTE_CLEANUP, self.callbacks
+            ):
+                callback(self, model, x_in, conds, timestep, model_options)
+
+
 # Based on WanContextWindowsManual in ComfyUI core
 class WanEx_ContextWindowsAdvanced:
     """
@@ -1208,6 +1420,12 @@ class WanEx_ContextWindowsAdvanced:
                     "tooltip": "Whether to split multiple conditionings (created by ConditioningCombine) to each window "
                               "based on region index. Useful for applying different prompts to different parts of the video."
                 }),
+                "explicit_cond_mapping": ("STRING", {
+                    "default": "",
+                    "tooltip": "Explicit mapping of conditionings to windows. Format: '0,1,2,3' maps cond[0] to window 0, "
+                              "cond[1] to window 1, etc. Repeats allowed: '0,0,1,1'. Extra windows repeat last entry. "
+                              "Takes precedence over split_conds_to_windows when provided."
+                }),
             }
         }
 
@@ -1218,7 +1436,8 @@ class WanEx_ContextWindowsAdvanced:
 
     def apply_context_windows(self, model, context_length, context_overlap, context_schedule, context_stride,
                                closed_loop, fuse_method, freenoise,
-                               cond_retain_index_list="", split_conds_to_windows=False):
+                               cond_retain_index_list="", split_conds_to_windows=False,
+                               explicit_cond_mapping=""):
         import comfy.context_windows
 
         # Convert frame counts to latent space (WAN uses 4:1 temporal compression)
@@ -1228,8 +1447,8 @@ class WanEx_ContextWindowsAdvanced:
         # Clone the model
         model = model.clone()
 
-        # Create context handler with all features enabled
-        model.model_options["context_handler"] = comfy.context_windows.IndexListContextHandler(
+        # Common handler kwargs
+        handler_kwargs = dict(
             context_schedule=comfy.context_windows.get_matching_context_schedule(context_schedule),
             fuse_method=comfy.context_windows.get_matching_fuse_method(fuse_method),
             context_length=latent_context_length,
@@ -1241,6 +1460,17 @@ class WanEx_ContextWindowsAdvanced:
             cond_retain_index_list=cond_retain_index_list,
             split_conds_to_windows=split_conds_to_windows
         )
+
+        # Use ExplicitMappingContextHandler if explicit mapping is provided
+        if explicit_cond_mapping.strip():
+            model.model_options["context_handler"] = ExplicitMappingContextHandler(
+                explicit_cond_mapping=explicit_cond_mapping,
+                **handler_kwargs
+            )
+        else:
+            model.model_options["context_handler"] = comfy.context_windows.IndexListContextHandler(
+                **handler_kwargs
+            )
 
         # make memory usage calculation only take into account the context window latents
         comfy.context_windows.create_prepare_sampling_wrapper(model)
@@ -1710,6 +1940,11 @@ class WanEx_ContextWindowsPreview:
                     "default": False,
                     "tooltip": "Preview how conditioning would be split across windows."
                 }),
+                "explicit_cond_mapping": ("STRING", {
+                    "default": "",
+                    "tooltip": "Preview explicit mapping of conditionings to windows. Format: '0,1,2,3'. "
+                              "Takes precedence over split_conds_to_windows when provided."
+                }),
             }
         }
 
@@ -1718,6 +1953,20 @@ class WanEx_ContextWindowsPreview:
     FUNCTION = "preview_windows"
     CATEGORY = "WanExperiments"
     OUTPUT_NODE = True
+
+    @staticmethod
+    def _parse_mapping(mapping_str: str) -> list:
+        """Parse mapping string like '0,1,2,3' into list of integers."""
+        if not mapping_str or not mapping_str.strip():
+            return None
+        try:
+            parts = [p.strip() for p in mapping_str.split(",") if p.strip()]
+            indices = [int(p) for p in parts]
+            if any(i < 0 for i in indices):
+                return None
+            return indices if indices else None
+        except ValueError:
+            return None
 
     def _calculate_windows_static(self, num_frames, context_length, context_overlap):
         """Replicate standard_static window calculation."""
@@ -1755,7 +2004,8 @@ class WanEx_ContextWindowsPreview:
         return min(max(region_idx, 0), num_regions - 1)
 
     def preview_windows(self, total_frames, context_length, context_overlap, context_schedule,
-                        model=None, positive=None, negative=None, split_conds_to_windows=False):
+                        model=None, positive=None, negative=None, split_conds_to_windows=False,
+                        explicit_cond_mapping=""):
 
         # Convert to latent frames (WAN 4:1 compression)
         latent_total = max(((total_frames - 1) // 4) + 1, 1)
@@ -1805,13 +2055,46 @@ class WanEx_ContextWindowsPreview:
         lines.append("-" * 50)
         lines.append(f"Total: {len(windows)} context window(s)")
 
-        # Conditioning split preview
-        if split_conds_to_windows and positive is not None:
+        # Parse explicit mapping if provided
+        explicit_mapping = self._parse_mapping(explicit_cond_mapping)
+
+        # Explicit conditioning mapping preview (takes precedence)
+        if explicit_mapping and positive is not None:
+            num_conds = len(positive)
+            lines.append("")
+            lines.append("=" * 50)
+            lines.append("Explicit Conditioning Mapping Preview")
+            lines.append("=" * 50)
+            lines.append(f"Mapping: {explicit_mapping}")
+            lines.append(f"Positive conditionings available: {num_conds}")
+            lines.append("")
+
+            for i, window in enumerate(windows):
+                # Get mapped index (repeat last if window exceeds mapping)
+                if i < len(explicit_mapping):
+                    mapped_idx = explicit_mapping[i]
+                else:
+                    mapped_idx = explicit_mapping[-1]
+                # Clamp to valid range
+                cond_idx = min(mapped_idx, num_conds - 1)
+
+                # Show if clamping occurred
+                clamp_note = ""
+                if mapped_idx != cond_idx:
+                    clamp_note = f" (clamped from {mapped_idx})"
+                repeat_note = ""
+                if i >= len(explicit_mapping):
+                    repeat_note = " [repeated]"
+
+                lines.append(f"  Window {i+1} → conditioning [{cond_idx}]{clamp_note}{repeat_note}")
+
+        # Conditioning split preview (center_ratio-based, only if no explicit mapping)
+        elif split_conds_to_windows and positive is not None:
             num_conds = len(positive)
             if num_conds > 1:
                 lines.append("")
                 lines.append("=" * 50)
-                lines.append("Conditioning Split Preview")
+                lines.append("Conditioning Split Preview (center_ratio)")
                 lines.append("=" * 50)
                 lines.append(f"Positive conditionings: {num_conds}")
                 lines.append("")
@@ -1834,6 +2117,143 @@ class WanEx_ContextWindowsPreview:
         return (model, positive, negative, preview_text)
 
 
+class WanEx_ContextWindowCalculator:
+    """
+    Calculates context window parameters to achieve a desired number of windows.
+    Works in temporal frame space (not latent)
+    This is a calculator node that outputs values to feed into context window nodes
+    like WanEx_ContextWindowsAdvanced or WanContextWindowsManualNode.
+
+    Math:
+        total_frames = context_length + (num_windows - 1) * (context_length - context_overlap)
+                     = num_windows * context_length - (num_windows - 1) * context_overlap
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "num_context_windows": ("INT", {
+                    "default": 5,
+                    "min": 1,
+                    "max": 100,
+                    "tooltip": "Desired number of context windows"
+                }),
+                "target_frames_per_window": ("INT", {
+                    "default": 81,
+                    "min": 1,
+                    "tooltip": "Target frames per window. Will be snapped to valid Wan values (1,5,9,13,17,21,25,29...)"
+                }),
+                "target_overlap_frames": ("INT", {
+                    "default": 29,
+                    "min": 0,
+                    "tooltip": "Target overlap frames. Will be snapped to valid Wan values (0,1,5,9,13,17,21,25,29...)"
+                }),
+                "prioritize": (["window_size", "overlap"], {
+                    "default": "window_size",
+                    "tooltip": "Which parameter to keep fixed when adjustment is needed"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("INT", "INT", "INT", "STRING")
+    RETURN_NAMES = ("context_length", "context_overlap", "total_frames", "info")
+    FUNCTION = "calculate"
+    CATEGORY = "WanExperiments/context"
+    DESCRIPTION = "Calculate context window parameters for a desired number of windows."
+
+    @staticmethod
+    def snap_to_valid_wan_frames(value, is_overlap=False):
+        """
+        Snap to nearest valid Wan frame number (4k+1 pattern).
+
+        For Wan models, temporal frames are compressed 4:1 to latent space:
+            latent = max(((temporal - 1) // 4) + 1, 1)
+
+        Valid temporal values that map cleanly: 1, 5, 9, 13, 17, 21, 25, 29, ...
+        For overlap: 0 is also valid (maps to latent 0).
+        """
+        if is_overlap and value <= 0:
+            return 0
+        if value < 1:
+            return 1
+        k = round((value - 1) / 4)
+        k = max(0, k)
+        return 4 * k + 1
+
+    def calculate(self, num_context_windows, target_frames_per_window,
+                  target_overlap_frames, prioritize):
+        N = num_context_windows
+
+        # Snap inputs to valid Wan frame numbers
+        L = self.snap_to_valid_wan_frames(target_frames_per_window)
+        O = self.snap_to_valid_wan_frames(target_overlap_frames, is_overlap=True)
+
+        # Ensure overlap < length
+        if O >= L:
+            # Find largest valid overlap less than L
+            k = (L - 2) // 4  # largest k where 4k+1 < L
+            O = max(0, 4 * k + 1) if k >= 0 else 0
+
+        prioritize_window = (prioritize == "window_size")
+
+        if N == 1:
+            # Single window: total = length, no overlap matters
+            total = L
+            O = 0
+        else:
+            if prioritize_window:
+                # L is fixed, calculate total with current O
+                total = N * L - (N - 1) * O
+                total = self.snap_to_valid_wan_frames(total)
+                # Recalculate O for exact fit
+                O_exact = (N * L - total) / (N - 1)
+                O = self.snap_to_valid_wan_frames(O_exact, is_overlap=True)
+                # Final total
+                total = N * L - (N - 1) * O
+            else:
+                # O is fixed, calculate total with current L
+                total = N * L - (N - 1) * O
+                total = self.snap_to_valid_wan_frames(total)
+                # Recalculate L for exact fit
+                L_exact = (total + (N - 1) * O) / N
+                L = self.snap_to_valid_wan_frames(L_exact)
+                # Final total
+                total = N * L - (N - 1) * O
+
+        # Ensure total is valid
+        total = self.snap_to_valid_wan_frames(total)
+
+        # Calculate latent equivalents for info
+        L_latent = max(((L - 1) // 4) + 1, 1)
+        O_latent = max(((O - 1) // 4) + 1, 0) if O > 0 else 0
+        total_latent = max(((total - 1) // 4) + 1, 1)
+
+        step = L - O
+
+        info = (
+            f"Context Windows Calculator\n"
+            f"==========================\n"
+            f"Requested: {N} windows\n"
+            f"Priority: {'window size' if prioritize_window else 'overlap'}\n\n"
+            f"Results (temporal frames):\n"
+            f"  Window size: {L} frames\n"
+            f"  Overlap: {O} frames\n"
+            f"  Step: {step} frames\n"
+            f"  Total needed: {total} frames\n\n"
+            f"Results (latent):\n"
+            f"  Window size: {L_latent}\n"
+            f"  Overlap: {O_latent}\n"
+            f"  Total: {total_latent}\n\n"
+            f"Verification:\n"
+            f"  {L} + {N-1} x {step} = {total}\n"
+            f"  Windows: {N}"
+        )
+
+        return (L, O, total, info)
+
+
+
 NODE_CLASS_MAPPINGS = {
     "WanEx_I2VCustomEmbeds": WanEx_I2VCustomEmbeds,
     "WanEx_BindweaveSubjectToVid": WanEx_BindweaveSubjectToVid,
@@ -1844,6 +2264,7 @@ NODE_CLASS_MAPPINGS = {
     "WanEx_HuMoImageToVideo": WanEx_HuMoImageToVideo,
     "WanEx_ContextWindowsAdvanced": WanEx_ContextWindowsAdvanced,
     "WanEx_ContextWindowsPreview": WanEx_ContextWindowsPreview,
+    "WanEx_ContextWindowCalculator": WanEx_ContextWindowCalculator,
     "WanEx_VideoColorMatch": WanEx_VideoColorMatch,
     "WanEx_VideoContrastMatch": WanEx_VideoContrastMatch,
 }
@@ -1856,8 +2277,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanEx_ConditioningEmbedsPreview": "WanEx ConditioningEmbedsPreview",
     "WanEx_PainterMotionAmplitude": "WanEx PainterMotionAmplitude",
     "WanEx_HuMoImageToVideo": "WanEx HuMoImageToVideo",
-    "WanEx_ContextWindowsAdvanced": "WanEx Context Windows",
-    "WanEx_ContextWindowsPreview": "WanEx Context Windows Preview",
-    "WanEx_VideoColorMatch": "WanEx Video Color Match",
-    "WanEx_VideoContrastMatch": "WanEx Video Contrast Match",
+    "WanEx_ContextWindowsAdvanced": "WanEx ContextWindows",
+    "WanEx_ContextWindowsPreview": "WanEx ContextWindowsPreview",
+    "WanEx_ContextWindowCalculator": "WanEx ContextWindowCalculator",
+    "WanEx_VideoColorMatch": "WanEx VideoColorMatch",
+    "WanEx_VideoContrastMatch": "WanEx VideoContrastMatch",
 }
