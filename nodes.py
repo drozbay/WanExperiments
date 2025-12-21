@@ -1043,6 +1043,7 @@ class WanEx_HuMoImageToVideo(io.ComfyNode):
                 io.Image.Input("ref_images", optional=True),
                 io.Image.Input("start_images", optional=True),
                 io.Image.Input("end_images", optional=True),
+                io.Float.Input("ref_strength", default=1.0, min=0.0, max=1000.0, step=0.01, optional=True),
             ],
             outputs=[
                 io.Conditioning.Output(display_name="positive"),
@@ -1053,7 +1054,7 @@ class WanEx_HuMoImageToVideo(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, positive, negative, vae, width, height, length, batch_size, ref_images=None, audio_encoder_output=None, start_images=None, end_images=None) -> io.NodeOutput:
+    def execute(cls, positive, negative, vae, width, height, length, batch_size, ref_images=None, audio_encoder_output=None, start_images=None, end_images=None, ref_strength=1.0) -> io.NodeOutput:
         latent_t = ((length - 1) // 4) + 1
         latent_height = height // 8
         latent_width = width // 8
@@ -1062,10 +1063,23 @@ class WanEx_HuMoImageToVideo(io.ComfyNode):
         if ref_images is not None:
             ref_images = comfy.utils.common_upscale(ref_images[:].movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
             num_refs = ref_images.shape[0]
-            ref_latent = vae.encode(ref_images[:1, :, :, :3])
-            # Append the other reference latents
+
+            if isinstance(ref_strength, list):
+                strength_values = ref_strength
+            else:
+                strength_values = [ref_strength]
+
+            # Encode first reference with its strength
+            strength_0 = strength_values[0] if len(strength_values) > 0 else 1.0
+            ref_latent = vae.encode(ref_images[:1, :, :, :3]) * strength_0
+
+            # Append the other reference latents with their strengths
             for i in range(num_refs - 1):
-                ref_latent = torch.cat((ref_latent, vae.encode(ref_images[i + 1:i + 2, :, :, :3])), dim=2)
+                # default to 1.0 if not specified
+                strength_i = strength_values[i + 1] if len(strength_values) > i + 1 else 1.0
+                encoded = vae.encode(ref_images[i + 1:i + 2, :, :, :3]) * strength_i
+                ref_latent = torch.cat((ref_latent, encoded), dim=2)
+
             positive = node_helpers.conditioning_set_values(positive, {"reference_latents": [ref_latent]}, append=True)
             negative = node_helpers.conditioning_set_values(negative, {"reference_latents": [torch.zeros_like(ref_latent)]}, append=True)
         else:
