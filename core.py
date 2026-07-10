@@ -176,7 +176,7 @@ class WAN21_BindweaveConfig(comfy.supported_models_base.BASE):
         self.memory_usage_factor = self.unet_config.get("dim", 2000) / 2222
 
     @classmethod
-    def matches(cls, unet_config, state_dict=None):
+    def matches(cls, unet_config, state_dict=None, unet_key_prefix=""):
         """Check if this is a BindWeave model"""
         if unet_config.get("image_model") != "wan2.1":
             return False
