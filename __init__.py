@@ -9,6 +9,10 @@ try:
 except ImportError:
     pass  # Mad science nodes not present
 
+from .nodes_s2v_bernini import NODE_CLASS_MAPPINGS as S2V_BERNINI_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS as S2V_BERNINI_DISPLAY_MAPPINGS
+NODE_CLASS_MAPPINGS.update(S2V_BERNINI_MAPPINGS)
+NODE_DISPLAY_NAME_MAPPINGS.update(S2V_BERNINI_DISPLAY_MAPPINGS)
+
 # Register model enhancements at import time
 register_wan_experiments_models()
 
