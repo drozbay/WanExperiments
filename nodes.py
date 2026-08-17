@@ -2,6 +2,7 @@ import nodes
 import comfy.utils
 import comfy.model_management
 import comfy.clip_vision
+import comfy.patcher_extension
 from comfy_api.latest import io
 import node_helpers
 import torch
@@ -1145,6 +1146,63 @@ class WanEx_HuMoImageToVideo(io.ComfyNode):
         return io.NodeOutput(positive, negative, out_latent)
 
 
+def _schedule_step(sigma, sigmas):
+    s = sigmas.detach().float().cpu()
+    if s.numel() < 2:
+        return 0
+    if s[0] >= s[-1]:
+        idx = int((s[:-1] >= sigma).sum().item()) - 1
+    else:
+        idx = int((s[:-1] <= sigma).sum().item()) - 1
+    return max(0, min(idx, s.numel() - 2))
+
+
+class WanEx_HuMoRefCycle(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="WanEx_HuMoRefCycle",
+            display_name="WanEx HuMoRefCycle",
+            category="WanExperiments",
+            inputs=[
+                io.Model.Input("model"),
+                io.Combo.Input("mode", options=["increment", "random"], default="increment",
+                               tooltip="increment rotates the reference order by one position each step. random reshuffles the order each step using the seed."),
+                io.Int.Input("cycle_end_step", default=-1, min=-1, max=10000,
+                             tooltip="Stop cycling at this schedule step and keep the original reference order for the rest of the run. -1 cycles for the whole schedule. Step indices follow sample_sigmas, so with RES4LYF samplers chained in resample mode this is the global schedule step."),
+                io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff,
+                             tooltip="Seed for random mode. Each step shuffles with seed + step, so results are reproducible."),
+            ],
+            outputs=[
+                io.Model.Output(),
+            ],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, model, mode, cycle_end_step, seed) -> io.NodeOutput:
+        def ref_cycle_wrapper(executor, x, t, c_concat=None, c_crossattn=None, control=None, transformer_options={}, **kwargs):
+            ref = kwargs.get("reference_latent", None)
+            sigmas = transformer_options.get("sample_sigmas", None)
+            if ref is not None and ref.ndim == 5 and ref.shape[2] > 1 and sigmas is not None:
+                step = _schedule_step(float(t.detach().max().cpu()), sigmas)
+                if cycle_end_step < 0 or step < cycle_end_step:
+                    num_refs = ref.shape[2]
+                    if mode == "increment":
+                        shift = step % num_refs
+                        if shift != 0:
+                            kwargs["reference_latent"] = torch.roll(ref, shifts=-shift, dims=2)
+                    else:
+                        gen = torch.Generator().manual_seed((seed + step) & 0xffffffffffffffff)
+                        perm = torch.randperm(num_refs, generator=gen)
+                        kwargs["reference_latent"] = ref[:, :, perm]
+            return executor(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
+
+        m = model.clone()
+        m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.APPLY_MODEL, "wanex_humo_ref_cycle", ref_cycle_wrapper)
+        return io.NodeOutput(m)
+
+
 import logging
 
 
@@ -2253,6 +2311,7 @@ NODE_CLASS_MAPPINGS = {
     "WanEx_ConditioningEmbedsPreview": WanEx_ConditioningEmbedsPreview,
     "WanEx_PainterMotionAmplitude": WanEx_PainterMotionAmplitude,
     "WanEx_HuMoImageToVideo": WanEx_HuMoImageToVideo,
+    "WanEx_HuMoRefCycle": WanEx_HuMoRefCycle,
     "WanEx_ContextWindowsAdvanced": WanEx_ContextWindowsAdvanced,
     "WanEx_ContextWindowsPreview": WanEx_ContextWindowsPreview,
     "WanEx_ContextWindowCalculator": WanEx_ContextWindowCalculator,
@@ -2268,6 +2327,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanEx_ConditioningEmbedsPreview": "WanEx ConditioningEmbedsPreview",
     "WanEx_PainterMotionAmplitude": "WanEx I2VDifferenceAugmentation",
     "WanEx_HuMoImageToVideo": "WanEx HuMoImageToVideo",
+    "WanEx_HuMoRefCycle": "WanEx HuMoRefCycle",
     "WanEx_ContextWindowsAdvanced": "WanEx ContextWindows",
     "WanEx_ContextWindowsPreview": "WanEx ContextWindowsPreview",
     "WanEx_ContextWindowCalculator": "WanEx ContextWindowCalculator",
